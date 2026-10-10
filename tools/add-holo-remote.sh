@@ -2,6 +2,7 @@
 # Add remote access to the local Holo rootfs (build/steamos/rootfs) before finalize-holo-rootfs.sh:
 #  - Wi-Fi without persistent writes (quest1-modem.service, wpa_supplicant, dhcpcd on wlan0)
 #  - iw, ip (iproute2) and hostname (inetutils) for work on the headset
+#  - network sockets for non-root (Android "inet" group), so timesyncd sets the clock; networkd on 4.4
 #  - OpenSSH: root login with a key only
 # Secrets come from SECRETS_DIR (default ~/.local/share/QuestStack/quest1-remote), never the repo:
 #   wpa_supplicant-wlan0.conf (Wi-Fi network and password)  root.pub (SSH key for root)
@@ -54,6 +55,11 @@ done <<< "$PKGS"
 exec 9>/tmp/cxx-build.lock
 flock 9
 "$P/tools/run-holo-local.sh" /usr/bin/pacman -U --needed --noconfirm "${files[@]}"
+"$P/tools/run-holo-local.sh" /bin/sh -c '
+	# CONFIG_ANDROID_PARANOID_NETWORK: only root and GID 3003 (AID_INET) may open IPv4/IPv6
+	# sockets; anyone else gets EACCES ("Temporary failure in name resolution").
+	getent group inet >/dev/null || groupadd -r -g 3003 inet
+	usermod -aG inet alpm  # pacman DownloadUser, should it be enabled'
 rm -rf "$I"
 
 # 2. Files. pack-holo-rootfs.py makes everything not owned by a package root:root, modes kept.
@@ -95,6 +101,24 @@ EOF
 link etc/systemd/system/multi-user.target.wants/sshd.service /usr/lib/systemd/system/sshd.service
 put 600 "$S/root.pub" root/.ssh/authorized_keys
 chmod 700 "$R/root/.ssh"
+
+# Time: timesyncd runs as systemd-timesync and needs inet (see above) to resolve and reach NTP
+# servers. Without it the clock stays wrong (the RTC reads 1970) and TLS fails, e.g. in pacman.
+put 644 /dev/stdin etc/systemd/system/systemd-timesyncd.service.d/10-android-inet.conf <<'EOF'
+[Service]
+SupplementaryGroups=inet
+EOF
+# networkd: kernel 4.4 has no nexthop objects; enumerating them fails fatally
+# ("Could not enumerate nexthops: Operation not supported").
+put 644 /dev/stdin etc/systemd/networkd.conf.d/10-quest1-kernel-4.4.conf <<'EOF'
+[Network]
+ManageForeignNextHops=no
+EOF
+# usb0: keep the initramfs address even when networkd stops; Wi-Fi (dhcpcd) decides "online",
+# so a missing USB cable doesn't stop timesyncd.
+n=$R/etc/systemd/network/10-usb0.network
+grep -q '^KeepConfiguration=' "$n" || sed -i 's/^ConfigureWithoutCarrier=yes$/&\nKeepConfiguration=yes/' "$n"
+grep -q '^RequiredForOnline=' "$n" || sed -i 's/^\[DHCPServer\]$/[Link]\nRequiredForOnline=no\n&/' "$n"
 
 f=$R/etc/quest1-base-release
 grep -q '^REMOTE_ACCESS=' "$f" || cat >> "$f" <<'EOF'

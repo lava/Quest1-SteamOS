@@ -68,6 +68,13 @@ python3 /usr/local/lib/quest1/mkproparea.py /dev/__properties__ \
 
 # 6. Daemons, in init.monterey.rc order
 touch $Q/started
+# systemd-shutdown must not kill them either: spare this service's cgroup until reboot(). systemd
+# itself only sets the user.* xattr, which kernel 4.4 rejects on cgroupfs; systemd-shutdown also
+# reads trusted.*.
+if [ -n "${INVOCATION_ID:-}" ]; then
+	cg=/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup)
+	setfattr -n trusted.survive_final_kill_signal -v 1 "$cg" || log "cannot mark $cg to survive shutdown"
+fi
 echo -n /run/fw > /sys/module/firmware_class/parameters/path
 echo 2 > /sys/class/firmware/timeout   # no ueventd to answer the user-helper fallback
 $E $V/irsc_util /vendor/etc/sec_config > $Q/irsc_util.log 2>&1 || true

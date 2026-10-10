@@ -73,7 +73,14 @@ mkdir -p "$R/android" "$R/system" "$R/firmware" "$R/apex" "$R/persist" "$R/mnt/v
 link vendor /system/vendor
 unit quest1-modem.service '[Unit]
 Description=Modem subsystem and WCN3990 Wi-Fi firmware (no persistent writes)
-After=local-fs.target
+# Never stopped from Linux: closing /dev/subsys_modem shuts the modem down and the next load hangs
+# the SoC. Not part of the shutdown transaction (no Conflicts=shutdown.target), and quest1-modem
+# marks its cgroup so that systemd-shutdown spares the daemons until the final reboot().
+DefaultDependencies=no
+After=local-fs.target sysinit.target
+IgnoreOnIsolate=yes
+# Only tries user.* (rejected by kernel 4.4), but keeps systemd from removing the trusted.* xattr
+SurviveFinalKillSignal=yes
 
 [Service]
 Type=oneshot
@@ -119,6 +126,33 @@ EOF
 n=$R/etc/systemd/network/10-usb0.network
 grep -q '^KeepConfiguration=' "$n" || sed -i 's/^ConfigureWithoutCarrier=yes$/&\nKeepConfiguration=yes/' "$n"
 grep -q '^RequiredForOnline=' "$n" || sed -i 's/^\[DHCPServer\]$/[Link]\nRequiredForOnline=no\n&/' "$n"
+# Kernel 4.4 lacks what networkd needs for IPv6 router discovery and its DHCP server (both fail
+# with "Protocol not available" and put usb0 in the failed state). The initramfs keeps busybox
+# udhcpd running for the host instead.
+sed -i 's/^DHCPServer=yes$/DHCPServer=no/' "$n"
+grep -q '^IPv6AcceptRA=' "$n" || sed -i 's/^KeepConfiguration=yes$/&\nIPv6AcceptRA=no/' "$n"
+
+# Shutdown: without kernel/cgroup-events-frozen.patch systemd never notices that a cgroup became
+# empty, so every stop that waits for leftover processes runs into its timeout twice. Short
+# timeouts bound that; harmless with the patch.
+put 644 /dev/stdin etc/systemd/system.conf.d/90-quest1-shutdown.conf <<'EOF'
+[Manager]
+DefaultTimeoutStopSec=10s
+EOF
+put 644 /dev/stdin etc/systemd/system/user@.service.d/90-quest1-shutdown.conf <<'EOF'
+[Service]
+TimeoutStopSec=10s
+EOF
+# dhcpcd -x (ExecStop) and then SIGTERM each hang for the full timeout at shutdown, once wlan0 is
+# going away; nothing needs the lease released.
+put 644 /dev/stdin etc/systemd/system/dhcpcd@wlan0.service.d/90-quest1-shutdown.conf <<'EOF'
+[Service]
+ExecStop=
+TimeoutStopSec=3s
+EOF
+# udev's v4l_id hangs for minutes on the msm camera nodes (workers killed after 3 min), and its open
+# of the Venus nodes starts a firmware load before /run/fw exists. Nothing needs v4l names.
+link etc/udev/rules.d/60-persistent-v4l.rules /dev/null
 
 f=$R/etc/quest1-base-release
 grep -q '^REMOTE_ACCESS=' "$f" || cat >> "$f" <<'EOF'

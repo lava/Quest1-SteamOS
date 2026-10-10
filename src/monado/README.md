@@ -5,6 +5,10 @@
 
 - `drivers/quest1`: 3DoF HMD from the SyncBoss IMU (Meta's libsyncboss.so through libhybris),
   Meta's Quest 1 lens distortion (CatmullRom10, docs/quest1-lens.md), views rotated 180°.
+  The four tracking cameras stream on demand (src/qcam sequence on the driver's SyncBoss handle,
+  auto exposure) to the root-only shared memory `/quest1-cameras` while a reader keeps a heartbeat
+  there; layout in `quest1_cameras_shm.h`, `QUEST1_CAMERAS=0` turns it off. `src/q1passthrough`
+  shows them.
 - `compositor/main/comp_window_mdp.c`: zero-copy target, gralloc buffers scanned out with
   MSMFB_ATOMIC_COMMIT, vsync pacing, panels/GPU governor switched with activity.
 - `XRT_HYBRIS_AHB`: AHardwareBuffer swapchains through libhybris (needs the Android

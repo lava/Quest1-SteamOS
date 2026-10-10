@@ -9,6 +9,7 @@
 #pragma once
 
 #include "xrt/xrt_device.h"
+#include "util/u_logging.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -65,6 +66,15 @@ struct quest1_controller_state
 	float trigger, grip;     //!< 0..1
 	float stick_x, stick_y;  //!< -1..1, +y up
 };
+
+//! Tracking cameras on the HMD's SyncBoss handle, frames in shared memory (quest1_cameras_shm.h).
+struct quest1_cameras;
+
+struct quest1_cameras *
+quest1_cameras_start(void *sb_handle, enum u_logging_level log_level);
+
+void
+quest1_cameras_destroy(struct quest1_cameras **c_ptr);
 
 struct quest1_controller;
 

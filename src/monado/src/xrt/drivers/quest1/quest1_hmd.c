@@ -43,6 +43,7 @@ DEBUG_GET_ONCE_LOG_OPTION(quest1_log, "QUEST1_LOG", U_LOGGING_INFO)
 // Calibrated on the device 2026-10-05: up = -x, look-down = +y, turn-left = -x, tilt-left = -z (IMU frame).
 DEBUG_GET_ONCE_OPTION(quest1_imu_axes, "QUEST1_IMU_AXES", "-y,-x,-z")
 DEBUG_GET_ONCE_BOOL_OPTION(quest1_controllers, "QUEST1_CONTROLLERS", true)
+DEBUG_GET_ONCE_BOOL_OPTION(quest1_cameras, "QUEST1_CAMERAS", true)
 
 #define Q1_TRACE(h, ...) U_LOG_XDEV_IFL_T(&h->base, h->log_level, __VA_ARGS__)
 #define Q1_DEBUG(h, ...) U_LOG_XDEV_IFL_D(&h->base, h->log_level, __VA_ARGS__)
@@ -211,6 +212,9 @@ struct quest1_hmd
 		uint8_t amplitude;
 		int64_t until_ns, last_sent_ns;
 	} haptic[2]; //!< Protected by ctrl_mutex.
+
+	//! Tracking cameras, streamed on demand; NULL with QUEST1_CAMERAS=0.
+	struct quest1_cameras *cameras;
 };
 
 static inline struct quest1_hmd *
@@ -526,6 +530,8 @@ hmd_destroy(struct xrt_device *xdev)
 		h->sb.input_stop(h->sb_handle);
 		os_nanosleep(300 * U_TIME_1MS_IN_NS); // the stop goes out while the IMU thread still pumps
 	}
+	// The camera commands need the IMU thread to keep pumping the stream.
+	quest1_cameras_destroy(&h->cameras);
 	os_thread_helper_destroy(&h->oth);
 	if (h->sb_handle != NULL) {
 		if (h->sb.imu_disable != NULL) {
@@ -735,6 +741,10 @@ quest1_hmd_create(void)
 		} else {
 			Q1_INFO(h, "controller radio started: press a button to wake the controllers");
 		}
+	}
+
+	if (debug_get_bool_option_quest1_cameras()) {
+		h->cameras = quest1_cameras_start(h->sb_handle, h->log_level);
 	}
 
 	u_var_add_root(h, "Quest 1 HMD", true);

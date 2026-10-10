@@ -1,5 +1,5 @@
 #!/bin/sh
-# Start the modem subsystem, which hosts the WCN3990 Wi-Fi firmware, and the qcacld driver (wlan0).
+# Set up the read-only Android layout (also used by the GPU, quest1-gpu.sh) and start the modem subsystem, which hosts the WCN3990 Wi-Fi firmware, and the qcacld driver (wlan0).
 # Derived from holo-android-modem.sh, but writes nothing persistent:
 #  - every Android partition (all of sd* except userdata's disk) is set read-only in the kernel;
 #  - the partitions the modem side writes (modemst1/2, fsg, fsc via rmt_storage; "private" = /persist
@@ -60,10 +60,11 @@ mkdir -p /data/vendor/tombstones/rfs/modem /data/vendor/wifi/wpa/sockets /data/v
 chown -R 2951:2951 /data/vendor/tombstones/rfs
 chmod 0771 /data/vendor/tombstones/rfs /data/vendor/tombstones/rfs/modem
 
-# 5. bionic property area
+# 5. bionic property area. Without service.sf.present_timestamp, Android's libvulkan waits forever
+# for SurfaceFlinger to set it.
 python3 /usr/local/lib/quest1/mkproparea.py /dev/__properties__ \
 	-s ro.hardware=monterey -s ro.boot.hardware=monterey -s ro.board.platform=msm8998 \
-	-s hwservicemanager.ready=true -s ro.boot.slot_suffix=$SLOT \
+	-s hwservicemanager.ready=true -s service.sf.present_timestamp=0 -s ro.boot.slot_suffix=$SLOT \
 	/android/system/build.prop /android/system/vendor/build.prop /android/system/etc/prop.default /android/default.prop
 
 # 6. Daemons, in init.monterey.rc order

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Add remote access to the local Holo rootfs (build/steamos/rootfs) before finalize-holo-rootfs.sh:
 #  - Wi-Fi without persistent writes (quest1-modem.service, wpa_supplicant, dhcpcd on wlan0)
+#  - the GPU through libhybris (quest1-gpu.service, Android HAL daemons, hybris-run)
 #  - iw, ip (iproute2) and hostname (inetutils) for work on the headset
 #  - network sockets for non-root (Android "inet" group), so timesyncd sets the clock; networkd on 4.4
 #  - OpenSSH: root login with a key only
@@ -91,6 +92,57 @@ TimeoutStartSec=120
 [Install]
 WantedBy=multi-user.target'
 link etc/systemd/system/multi-user.target.wants/quest1-modem.service /etc/systemd/system/quest1-modem.service
+
+# GPU: Meta's Adreno Vulkan driver through libhybris (/opt/hybris, from the base build). It needs
+# the HAL overlay (quest1-gpu) and three Android daemons from system_b: the HIDL registry, the
+# graphics allocator (gralloc buffers) and configstore (libvulkan waits forever without it).
+[[ -f $R/opt/hybris/lib/libbionictls.so ]] || { echo "No libhybris in $R/opt/hybris" >&2; exit 1; }
+put 755 "$P/device/quest1-gpu.sh" usr/local/sbin/quest1-gpu
+put 755 "$P/device/hybris-run.sh" usr/local/bin/hybris-run
+unit quest1-gpu.service '[Unit]
+Description=Adreno Vulkan and gralloc as the libhybris HAL defaults
+# quest1-modem mounts system_b; it may still fail later, on the Wi-Fi
+Wants=quest1-modem.service
+After=quest1-modem.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/quest1-gpu'
+AENV='Environment=ANDROID_ROOT=/system ANDROID_DATA=/data ANDROID_RUNTIME_ROOT=/apex/com.android.runtime'
+unit android-hwservicemanager.service "[Unit]
+Description=Android hwservicemanager (HIDL registry)
+Requires=quest1-gpu.service
+After=quest1-gpu.service
+
+[Service]
+$AENV
+ExecStart=/system/bin/hwservicemanager
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target"
+hal() { # name description binary
+	unit "android-$1.service" "[Unit]
+Description=Android HAL: $2
+Requires=android-hwservicemanager.service
+After=android-hwservicemanager.service
+
+[Service]
+$AENV
+# hwservicemanager.ready is preset in the property area: give the registry time to start
+ExecStartPre=/bin/sleep 0.5
+ExecStart=$3
+Restart=on-failure
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target"
+	link "etc/systemd/system/multi-user.target.wants/android-$1.service" "/etc/systemd/system/android-$1.service"
+}
+link etc/systemd/system/multi-user.target.wants/android-hwservicemanager.service /etc/systemd/system/android-hwservicemanager.service
+hal gralloc "graphics allocator" /system/vendor/bin/hw/android.hardware.graphics.allocator@2.0-service
+hal configstore configstore /system/vendor/bin/hw/android.hardware.configstore@1.1-service
 
 # wpa_supplicant-nl80211@wlan0 reads wpa_supplicant-nl80211-wlan0.conf
 put 600 "$S/wpa_supplicant-wlan0.conf" etc/wpa_supplicant/wpa_supplicant-nl80211-wlan0.conf

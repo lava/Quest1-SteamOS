@@ -2,6 +2,7 @@
 # Add remote access to the local Holo rootfs (build/steamos/rootfs) before finalize-holo-rootfs.sh:
 #  - Wi-Fi without persistent writes (quest1-modem.service, wpa_supplicant, dhcpcd on wlan0)
 #  - the GPU through libhybris (quest1-gpu.service, Android HAL daemons, hybris-run)
+#  - Monado (OpenXR runtime, monado.service) with the xrgears demo; xr-run starts clients: xr-run xrgears
 #  - iw, ip (iproute2) and hostname (inetutils) for work on the headset
 #  - network sockets for non-root (Android "inet" group), so timesyncd sets the clock; networkd on 4.4
 #  - OpenSSH: root login with a key only
@@ -205,6 +206,25 @@ EOF
 # udev's v4l_id hangs for minutes on the msm camera nodes (workers killed after 3 min), and its open
 # of the Venus nodes starts a firmware load before /run/fw exists. Nothing needs v4l names.
 link etc/udev/rules.d/60-persistent-v4l.rules /dev/null
+
+# OpenXR: Monado (/opt/monado, built with the Quest 1 driver) as a service; clients run through
+# xr-run, e.g. xr-run xrgears. The proximity sensor blanks the display as usual (no QUEST1_IGNORE_PROX).
+[[ -x $R/opt/monado/bin/monado-service ]] || { echo "No Monado in $R/opt/monado" >&2; exit 1; }
+put 755 "$P/device/xr-run.sh" usr/local/bin/xr-run
+unit monado.service "[Unit]
+Description=Monado OpenXR runtime
+Requires=quest1-gpu.service android-gralloc.service android-configstore.service
+After=quest1-gpu.service android-gralloc.service android-configstore.service
+
+[Service]
+RuntimeDirectory=monado
+Environment=XDG_RUNTIME_DIR=/run/monado HOME=/root XRT_NO_STDIN=1 XRT_COMPOSITOR_SCALE_PERCENTAGE=85 XRT_COMPOSITOR_COMPUTE=0
+ExecStart=/usr/local/bin/hybris-run /opt/monado/bin/monado-service
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target"
+link etc/systemd/system/multi-user.target.wants/monado.service /etc/systemd/system/monado.service
 
 f=$R/etc/quest1-base-release
 grep -q '^REMOTE_ACCESS=' "$f" || cat >> "$f" <<'EOF'

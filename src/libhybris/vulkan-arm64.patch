@@ -1,0 +1,94 @@
+diff --git a/hybris/vulkan/vulkan.c b/hybris/vulkan/vulkan.c
+index 915ece6..240b191 100644
+--- a/hybris/vulkan/vulkan.c
++++ b/hybris/vulkan/vulkan.c
+@@ -40,6 +40,45 @@ static void *vulkan_handle = NULL;
+  * This means effectively 0 call overhead after the first call.
+  */
+ 
++#if defined(__aarch64__)
++/*
++ * No IFUNCs on arm64: an IFUNC resolver runs while ld.so relocates the program, before libc is
++ * initialized, whenever the program binds immediately (BIND_NOW, or GLOB_DAT relocations from
++ * taking a function's address, as most distribution builds do). Loading the Android library from
++ * there corrupts glibc's malloc state. Instead, each entry point is a trampoline that jumps through
++ * a pointer, resolved on the first call (argument registers saved around the lookup).
++ */
++#define VULKAN_IDLOAD(sym) \
++static void *sym ## _ptr __attribute__((used)); \
++static void *sym ## _resolve(void) __attribute__((used)); \
++static void *sym ## _resolve(void) \
++{ \
++    if (!vulkan_handle) _init_androidvulkan(); \
++    void *f = android_dlsym(vulkan_handle, #sym); \
++    __atomic_store_n(&sym ## _ptr, f, __ATOMIC_RELEASE); \
++    return f; \
++} \
++__asm__ (".text\n.p2align 2\n.globl " #sym "\n.type " #sym ", %function\n" #sym ":\n" \
++    "  adrp x16, " #sym "_ptr\n" \
++    "  ldr x16, [x16, #:lo12:" #sym "_ptr]\n" \
++    "  cbz x16, 1f\n" \
++    "  br x16\n" \
++    "1: stp x29, x30, [sp, #-224]!\n" \
++    "  mov x29, sp\n" \
++    "  stp x0, x1, [sp, #16]\n  stp x2, x3, [sp, #32]\n" \
++    "  stp x4, x5, [sp, #48]\n  stp x6, x7, [sp, #64]\n  str x8, [sp, #80]\n" \
++    "  stp q0, q1, [sp, #96]\n  stp q2, q3, [sp, #128]\n" \
++    "  stp q4, q5, [sp, #160]\n  stp q6, q7, [sp, #192]\n" \
++    "  bl " #sym "_resolve\n" \
++    "  mov x16, x0\n" \
++    "  ldp x0, x1, [sp, #16]\n  ldp x2, x3, [sp, #32]\n" \
++    "  ldp x4, x5, [sp, #48]\n  ldp x6, x7, [sp, #64]\n  ldr x8, [sp, #80]\n" \
++    "  ldp q0, q1, [sp, #96]\n  ldp q2, q3, [sp, #128]\n" \
++    "  ldp q4, q5, [sp, #160]\n  ldp q6, q7, [sp, #192]\n" \
++    "  ldp x29, x30, [sp], #224\n" \
++    "  br x16\n" \
++    ".size " #sym ", .-" #sym "\n");
++#else
+ #define VULKAN_IDLOAD(sym) \
+  __asm__ (".type " #sym ", %gnu_indirect_function"); \
+ typeof(sym) * sym ## _dispatch (void) __asm__ (#sym);\
+@@ -48,6 +87,7 @@ typeof(sym) * sym ## _dispatch (void) \
+     if (!vulkan_handle) _init_androidvulkan(); \
+     return (void *) android_dlsym(vulkan_handle, #sym); \
+ }
++#endif
+ 
+ static void _init_androidvulkan()
+ {
+@@ -101,7 +141,34 @@ VkResult vkEnumerateInstanceExtensionProperties(const char* pLayerName, uint32_t
+     }
+     ws_vkSetInstanceProcAddrFunc((PFN_vkVoidFunction)_vkGetInstanceProcAddr);
+ 
+-    return ws_vkEnumerateInstanceExtensionProperties(pLayerName, pPropertyCount, pProperties);
++    /* Android 10's loader lists VK_EXT_debug_utils but its vkCreateInstance rejects it
++     * (VK_ERROR_EXTENSION_NOT_PRESENT): hide it, so that applications don't ask for it. */
++    uint32_t n = 0;
++    VkResult r = ws_vkEnumerateInstanceExtensionProperties(pLayerName, &n, NULL);
++    if (r != VK_SUCCESS)
++        return r;
++    VkExtensionProperties *all = malloc((n ? n : 1) * sizeof(*all));
++    if (!all)
++        return VK_ERROR_OUT_OF_HOST_MEMORY;
++    r = ws_vkEnumerateInstanceExtensionProperties(pLayerName, &n, all);
++    if (r != VK_SUCCESS && r != VK_INCOMPLETE) {
++        free(all);
++        return r;
++    }
++    uint32_t kept = 0;
++    for (uint32_t i = 0; i < n; i++)
++        if (strcmp(all[i].extensionName, VK_EXT_DEBUG_UTILS_EXTENSION_NAME) != 0)
++            all[kept++] = all[i];
++    if (pProperties == NULL) {
++        *pPropertyCount = kept;
++    } else {
++        uint32_t c = *pPropertyCount < kept ? *pPropertyCount : kept;
++        memcpy(pProperties, all, c * sizeof(*all));
++        *pPropertyCount = c;
++        r = c < kept ? VK_INCOMPLETE : VK_SUCCESS;
++    }
++    free(all);
++    return pProperties == NULL ? VK_SUCCESS : r;
+ }
+ 
+ #ifdef WANT_WAYLAND

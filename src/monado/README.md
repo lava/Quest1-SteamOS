@@ -8,7 +8,10 @@
   The four tracking cameras stream on demand (src/qcam sequence on the driver's SyncBoss handle,
   auto exposure) to the root-only shared memory `/quest1-cameras` while a reader keeps a heartbeat
   there; layout in `quest1_cameras_shm.h`, `QUEST1_CAMERAS=0` turns it off. `src/q1passthrough`
-  shows them.
+  shows them. The same memory carries the raw 1 kHz IMU samples and, per frameset, the SyncBoss
+  shutter time (mid-exposure, on the IMU clock) for SLAM; `src/q1record` records both as a EuRoC
+  dataset. `QUEST1_CAMERA_EXPOSURE_MAX_US` caps the auto exposure (default 14000; about 6000 for
+  less motion blur), `QUEST1_CAMERA_EXPOSURE_US` fixes it.
 - `compositor/main/comp_window_mdp.c`: zero-copy target, gralloc buffers scanned out with
   MSMFB_ATOMIC_COMMIT, vsync pacing, panels/GPU governor switched with activity.
 - `XRT_HYBRIS_AHB`: AHardwareBuffer swapchains through libhybris (needs the Android

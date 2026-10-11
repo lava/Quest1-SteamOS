@@ -38,6 +38,8 @@ android_dlsym(void *handle, const char *symbol);
 
 DEBUG_GET_ONCE_NUM_OPTION(quest1_camera_exposure, "QUEST1_CAMERA_EXPOSURE_US", 0) // 0 = auto
 DEBUG_GET_ONCE_FLOAT_OPTION(quest1_camera_gain, "QUEST1_CAMERA_GAIN", 4.0f)
+// Auto-exposure limit; SLAM wants short exposures (less motion blur) and more gain instead.
+DEBUG_GET_ONCE_NUM_OPTION(quest1_camera_exposure_max, "QUEST1_CAMERA_EXPOSURE_MAX_US", 14000)
 
 #define CAM_ERROR(c, ...) U_LOG_IFL_E(c->log_level, "cameras: " __VA_ARGS__)
 #define CAM_INFO(c, ...) U_LOG_IFL_I(c->log_level, "cameras: " __VA_ARGS__)
@@ -49,6 +51,8 @@ DEBUG_GET_ONCE_FLOAT_OPTION(quest1_camera_gain, "QUEST1_CAMERA_GAIN", 4.0f)
 #define CAM_TAG_HEADSET 1
 #define CAM_EXP_MIN_US 100
 #define CAM_EXP_MAX_US 14000 // below the 16.7 ms frame slot
+#define CAM_SHUTTER_RING 32
+#define CAM_SHUTTER_MAX_AGE_NS (200 * U_TIME_1MS_IN_NS)
 #define CAM_GAIN_MAX_X16 128 // 8x
 #define CAM_TARGET_MEAN 90.0f
 #define CAM_DEMAND_TIMEOUT_NS (2 * (int64_t)U_TIME_1S_IN_NS) // after the last reader heartbeat
@@ -144,9 +148,19 @@ struct quest1_cameras
 	uint8_t params[256];
 
 	struct q1cam_shm *shm;
-	int exposure_us;
+	int exposure_us, exposure_max_us;
 	uint16_t gain_x16, gain_min_x16;
 	bool auto_exposure;
+
+	//! SyncBoss shutter records from the IMU thread.
+	struct os_mutex shutter_mutex;
+	struct
+	{
+		uint64_t ts_us;    // IMU clock
+		int64_t recv_ns;   // monotonic arrival
+		uint8_t sync_id;
+	} shutter[CAM_SHUTTER_RING];
+	uint32_t shutter_head;
 };
 
 #define LOAD(lib, field, name)                                                                                         \
@@ -404,7 +418,7 @@ update_exposure(struct quest1_cameras *c, const struct q1cam_slot *s)
 	ratio = ratio < 0.7f ? 0.7f : (ratio > 1.4f ? 1.4f : ratio);
 	// Exposure first; gain (from QUEST1_CAMERA_GAIN up to CAM_GAIN_MAX_X16) only at the exposure limit.
 	int exp = c->exposure_us, gain = c->gain_x16;
-	if (ratio > 1.0f && exp >= CAM_EXP_MAX_US) {
+	if (ratio > 1.0f && exp >= c->exposure_max_us) {
 		gain = (int)((float)gain * ratio);
 	} else if (ratio < 1.0f && gain > c->gain_min_x16) {
 		gain = (int)((float)gain * ratio);
@@ -412,7 +426,7 @@ update_exposure(struct quest1_cameras *c, const struct q1cam_slot *s)
 	} else {
 		exp = (int)((float)exp * ratio);
 	}
-	exp = exp < CAM_EXP_MIN_US ? CAM_EXP_MIN_US : (exp > CAM_EXP_MAX_US ? CAM_EXP_MAX_US : exp);
+	exp = exp < CAM_EXP_MIN_US ? CAM_EXP_MIN_US : (exp > c->exposure_max_us ? c->exposure_max_us : exp);
 	gain = gain > CAM_GAIN_MAX_X16 ? CAM_GAIN_MAX_X16 : gain;
 	if (abs(exp - c->exposure_us) * 20 > c->exposure_us || abs(gain - c->gain_x16) * 20 > c->gain_x16) {
 		CAM_DEBUG(c, "mean %.1f, exposure %d -> %d us, gain %d -> %d /16", mean, c->exposure_us, exp,
@@ -423,11 +437,34 @@ update_exposure(struct quest1_cameras *c, const struct q1cam_slot *s)
 	}
 }
 
+//! The newest recent shutter record with this frame-sync id (4 bits), 0 if none.
+static int64_t
+find_shutter_ns(struct quest1_cameras *c, uint8_t sync_id)
+{
+	int64_t now = os_monotonic_get_ns(), ts = 0;
+	os_mutex_lock(&c->shutter_mutex);
+	for (uint32_t i = 1; i <= CAM_SHUTTER_RING && i <= c->shutter_head; i++) {
+		uint32_t k = (c->shutter_head - i) % CAM_SHUTTER_RING;
+		if (now - c->shutter[k].recv_ns > CAM_SHUTTER_MAX_AGE_NS) {
+			break;
+		}
+		if ((c->shutter[k].sync_id & 0xf) == (sync_id & 0xf)) {
+			ts = (int64_t)(c->shutter[k].ts_us * U_TIME_1US_IN_NS);
+			break;
+		}
+	}
+	os_mutex_unlock(&c->shutter_mutex);
+	return ts;
+}
+
 //! Dequeues one frameset; HEADSET framesets are published. False on a dequeue timeout.
 static bool
 capture_frameset(struct quest1_cameras *c, uint64_t *seq)
 {
 	struct q1cam_slot *s = &c->shm->slot[(*seq + 1) % Q1CAM_SLOTS];
+	// Readers still copying this slot must see that it changes under them.
+	__atomic_store_n(&s->seq, 0, __ATOMIC_RELAXED);
+	__atomic_thread_fence(__ATOMIC_RELEASE);
 	struct qc_frame *f[Q1CAM_N];
 	bool ok = true, headset = false;
 	for (int i = 0; i < Q1CAM_N; i++) {
@@ -442,6 +479,8 @@ capture_frameset(struct quest1_cameras *c, uint64_t *seq)
 		if (i == 0) {
 			headset = m.tag == CAM_TAG_HEADSET;
 			s->timestamp_ns = f[i]->ts_sec * U_TIME_1S_IN_NS + f[i]->ts_nsec;
+			s->sync_id = m.sync_id;
+			s->shutter_ns = headset ? find_shutter_ns(c, m.sync_id) : 0;
 		}
 		if (headset) {
 			memcpy(s->pixels[i], f[i]->data + Q1CAM_W, Q1CAM_W * Q1CAM_H); // skip the metadata line
@@ -529,6 +568,14 @@ quest1_cameras_start(void *sb_handle, enum u_logging_level log_level)
 	c->exposure_us = c->auto_exposure ? 8000 : (int)exp;
 	c->gain_x16 = (uint16_t)(debug_get_float_option_quest1_camera_gain() * 16.0f + 0.5f);
 	c->gain_min_x16 = c->gain_x16;
+	c->exposure_max_us = (int)debug_get_num_option_quest1_camera_exposure_max();
+	c->exposure_max_us = c->exposure_max_us < CAM_EXP_MIN_US   ? CAM_EXP_MIN_US
+	                     : c->exposure_max_us > CAM_EXP_MAX_US ? CAM_EXP_MAX_US
+	                                                           : c->exposure_max_us;
+	if (c->auto_exposure && c->exposure_us > c->exposure_max_us) {
+		c->exposure_us = c->exposure_max_us;
+	}
+	os_mutex_init(&c->shutter_mutex);
 	os_thread_helper_init(&c->oth);
 
 	if (!load_api(c) || !create_shm(c) || os_thread_helper_start(&c->oth, camera_thread, c) != 0) {
@@ -539,17 +586,65 @@ quest1_cameras_start(void *sb_handle, enum u_logging_level log_level)
 }
 
 void
+quest1_cameras_stop(struct quest1_cameras *c)
+{
+	if (c != NULL) {
+		os_thread_helper_stop_and_wait(&c->oth); // the thread stops the cameras
+	}
+}
+
+void
 quest1_cameras_destroy(struct quest1_cameras **c_ptr)
 {
 	struct quest1_cameras *c = *c_ptr;
 	if (c == NULL) {
 		return;
 	}
-	os_thread_helper_destroy(&c->oth); // the thread stops the cameras
+	os_thread_helper_destroy(&c->oth); // stops the thread (and so the cameras) if still running
+	os_mutex_destroy(&c->shutter_mutex);
 	if (c->shm != NULL) {
 		munmap(c->shm, sizeof(struct q1cam_shm));
 		shm_unlink(Q1CAM_SHM_NAME);
 	}
 	free(c);
 	*c_ptr = NULL;
+}
+
+void
+quest1_cameras_push_imu(struct quest1_cameras *c,
+                        uint64_t timestamp_us,
+                        const float accel[3],
+                        const float gyro[3],
+                        float temperature,
+                        int64_t imu_to_monotonic_ns)
+{
+	if (c == NULL) {
+		return;
+	}
+	struct q1cam_shm *shm = c->shm;
+	uint64_t n = shm->imu_latest + 1; // only this thread writes
+	struct q1cam_imu_sample *e = &shm->imu[n % Q1CAM_IMU_RING];
+	__atomic_store_n(&e->seq, 0, __ATOMIC_RELAXED);
+	__atomic_thread_fence(__ATOMIC_RELEASE);
+	e->timestamp_ns = (int64_t)(timestamp_us * U_TIME_1US_IN_NS);
+	memcpy(e->accel, accel, sizeof(e->accel));
+	memcpy(e->gyro, gyro, sizeof(e->gyro));
+	e->temperature = temperature;
+	__atomic_store_n(&e->seq, n, __ATOMIC_RELEASE);
+	__atomic_store_n(&shm->imu_to_monotonic_ns, imu_to_monotonic_ns, __ATOMIC_RELAXED);
+	__atomic_store_n(&shm->imu_latest, n, __ATOMIC_RELEASE);
+}
+
+void
+quest1_cameras_push_shutter(struct quest1_cameras *c, uint64_t timestamp_us, uint8_t sync_id)
+{
+	if (c == NULL) {
+		return;
+	}
+	os_mutex_lock(&c->shutter_mutex);
+	uint32_t k = c->shutter_head++ % CAM_SHUTTER_RING;
+	c->shutter[k].ts_us = timestamp_us;
+	c->shutter[k].recv_ns = os_monotonic_get_ns();
+	c->shutter[k].sync_id = sync_id;
+	os_mutex_unlock(&c->shutter_mutex);
 }

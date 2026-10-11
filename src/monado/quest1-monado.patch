@@ -5143,10 +5143,10 @@ index 0000000..0023e56
 +}
 diff --git a/src/xrt/drivers/quest1/quest1_cameras.c b/src/xrt/drivers/quest1/quest1_cameras.c
 new file mode 100644
-index 0000000..d2a6b2b
+index 0000000..fdd60fb
 --- /dev/null
 +++ b/src/xrt/drivers/quest1/quest1_cameras.c
-@@ -0,0 +1,555 @@
+@@ -0,0 +1,650 @@
 +// Copyright 2026, Quest1-SteamOS contributors
 +// SPDX-License-Identifier: BSL-1.0
 +/*!
@@ -5187,6 +5187,8 @@ index 0000000..d2a6b2b
 +
 +DEBUG_GET_ONCE_NUM_OPTION(quest1_camera_exposure, "QUEST1_CAMERA_EXPOSURE_US", 0) // 0 = auto
 +DEBUG_GET_ONCE_FLOAT_OPTION(quest1_camera_gain, "QUEST1_CAMERA_GAIN", 4.0f)
++// Auto-exposure limit; SLAM wants short exposures (less motion blur) and more gain instead.
++DEBUG_GET_ONCE_NUM_OPTION(quest1_camera_exposure_max, "QUEST1_CAMERA_EXPOSURE_MAX_US", 14000)
 +
 +#define CAM_ERROR(c, ...) U_LOG_IFL_E(c->log_level, "cameras: " __VA_ARGS__)
 +#define CAM_INFO(c, ...) U_LOG_IFL_I(c->log_level, "cameras: " __VA_ARGS__)
@@ -5198,6 +5200,8 @@ index 0000000..d2a6b2b
 +#define CAM_TAG_HEADSET 1
 +#define CAM_EXP_MIN_US 100
 +#define CAM_EXP_MAX_US 14000 // below the 16.7 ms frame slot
++#define CAM_SHUTTER_RING 32
++#define CAM_SHUTTER_MAX_AGE_NS (200 * U_TIME_1MS_IN_NS)
 +#define CAM_GAIN_MAX_X16 128 // 8x
 +#define CAM_TARGET_MEAN 90.0f
 +#define CAM_DEMAND_TIMEOUT_NS (2 * (int64_t)U_TIME_1S_IN_NS) // after the last reader heartbeat
@@ -5293,9 +5297,19 @@ index 0000000..d2a6b2b
 +	uint8_t params[256];
 +
 +	struct q1cam_shm *shm;
-+	int exposure_us;
++	int exposure_us, exposure_max_us;
 +	uint16_t gain_x16, gain_min_x16;
 +	bool auto_exposure;
++
++	//! SyncBoss shutter records from the IMU thread.
++	struct os_mutex shutter_mutex;
++	struct
++	{
++		uint64_t ts_us;    // IMU clock
++		int64_t recv_ns;   // monotonic arrival
++		uint8_t sync_id;
++	} shutter[CAM_SHUTTER_RING];
++	uint32_t shutter_head;
 +};
 +
 +#define LOAD(lib, field, name)                                                                                         \
@@ -5553,7 +5567,7 @@ index 0000000..d2a6b2b
 +	ratio = ratio < 0.7f ? 0.7f : (ratio > 1.4f ? 1.4f : ratio);
 +	// Exposure first; gain (from QUEST1_CAMERA_GAIN up to CAM_GAIN_MAX_X16) only at the exposure limit.
 +	int exp = c->exposure_us, gain = c->gain_x16;
-+	if (ratio > 1.0f && exp >= CAM_EXP_MAX_US) {
++	if (ratio > 1.0f && exp >= c->exposure_max_us) {
 +		gain = (int)((float)gain * ratio);
 +	} else if (ratio < 1.0f && gain > c->gain_min_x16) {
 +		gain = (int)((float)gain * ratio);
@@ -5561,7 +5575,7 @@ index 0000000..d2a6b2b
 +	} else {
 +		exp = (int)((float)exp * ratio);
 +	}
-+	exp = exp < CAM_EXP_MIN_US ? CAM_EXP_MIN_US : (exp > CAM_EXP_MAX_US ? CAM_EXP_MAX_US : exp);
++	exp = exp < CAM_EXP_MIN_US ? CAM_EXP_MIN_US : (exp > c->exposure_max_us ? c->exposure_max_us : exp);
 +	gain = gain > CAM_GAIN_MAX_X16 ? CAM_GAIN_MAX_X16 : gain;
 +	if (abs(exp - c->exposure_us) * 20 > c->exposure_us || abs(gain - c->gain_x16) * 20 > c->gain_x16) {
 +		CAM_DEBUG(c, "mean %.1f, exposure %d -> %d us, gain %d -> %d /16", mean, c->exposure_us, exp,
@@ -5572,11 +5586,34 @@ index 0000000..d2a6b2b
 +	}
 +}
 +
++//! The newest recent shutter record with this frame-sync id (4 bits), 0 if none.
++static int64_t
++find_shutter_ns(struct quest1_cameras *c, uint8_t sync_id)
++{
++	int64_t now = os_monotonic_get_ns(), ts = 0;
++	os_mutex_lock(&c->shutter_mutex);
++	for (uint32_t i = 1; i <= CAM_SHUTTER_RING && i <= c->shutter_head; i++) {
++		uint32_t k = (c->shutter_head - i) % CAM_SHUTTER_RING;
++		if (now - c->shutter[k].recv_ns > CAM_SHUTTER_MAX_AGE_NS) {
++			break;
++		}
++		if ((c->shutter[k].sync_id & 0xf) == (sync_id & 0xf)) {
++			ts = (int64_t)(c->shutter[k].ts_us * U_TIME_1US_IN_NS);
++			break;
++		}
++	}
++	os_mutex_unlock(&c->shutter_mutex);
++	return ts;
++}
++
 +//! Dequeues one frameset; HEADSET framesets are published. False on a dequeue timeout.
 +static bool
 +capture_frameset(struct quest1_cameras *c, uint64_t *seq)
 +{
 +	struct q1cam_slot *s = &c->shm->slot[(*seq + 1) % Q1CAM_SLOTS];
++	// Readers still copying this slot must see that it changes under them.
++	__atomic_store_n(&s->seq, 0, __ATOMIC_RELAXED);
++	__atomic_thread_fence(__ATOMIC_RELEASE);
 +	struct qc_frame *f[Q1CAM_N];
 +	bool ok = true, headset = false;
 +	for (int i = 0; i < Q1CAM_N; i++) {
@@ -5591,6 +5628,8 @@ index 0000000..d2a6b2b
 +		if (i == 0) {
 +			headset = m.tag == CAM_TAG_HEADSET;
 +			s->timestamp_ns = f[i]->ts_sec * U_TIME_1S_IN_NS + f[i]->ts_nsec;
++			s->sync_id = m.sync_id;
++			s->shutter_ns = headset ? find_shutter_ns(c, m.sync_id) : 0;
 +		}
 +		if (headset) {
 +			memcpy(s->pixels[i], f[i]->data + Q1CAM_W, Q1CAM_W * Q1CAM_H); // skip the metadata line
@@ -5678,6 +5717,14 @@ index 0000000..d2a6b2b
 +	c->exposure_us = c->auto_exposure ? 8000 : (int)exp;
 +	c->gain_x16 = (uint16_t)(debug_get_float_option_quest1_camera_gain() * 16.0f + 0.5f);
 +	c->gain_min_x16 = c->gain_x16;
++	c->exposure_max_us = (int)debug_get_num_option_quest1_camera_exposure_max();
++	c->exposure_max_us = c->exposure_max_us < CAM_EXP_MIN_US   ? CAM_EXP_MIN_US
++	                     : c->exposure_max_us > CAM_EXP_MAX_US ? CAM_EXP_MAX_US
++	                                                           : c->exposure_max_us;
++	if (c->auto_exposure && c->exposure_us > c->exposure_max_us) {
++		c->exposure_us = c->exposure_max_us;
++	}
++	os_mutex_init(&c->shutter_mutex);
 +	os_thread_helper_init(&c->oth);
 +
 +	if (!load_api(c) || !create_shm(c) || os_thread_helper_start(&c->oth, camera_thread, c) != 0) {
@@ -5688,13 +5735,22 @@ index 0000000..d2a6b2b
 +}
 +
 +void
++quest1_cameras_stop(struct quest1_cameras *c)
++{
++	if (c != NULL) {
++		os_thread_helper_stop_and_wait(&c->oth); // the thread stops the cameras
++	}
++}
++
++void
 +quest1_cameras_destroy(struct quest1_cameras **c_ptr)
 +{
 +	struct quest1_cameras *c = *c_ptr;
 +	if (c == NULL) {
 +		return;
 +	}
-+	os_thread_helper_destroy(&c->oth); // the thread stops the cameras
++	os_thread_helper_destroy(&c->oth); // stops the thread (and so the cameras) if still running
++	os_mutex_destroy(&c->shutter_mutex);
 +	if (c->shm != NULL) {
 +		munmap(c->shm, sizeof(struct q1cam_shm));
 +		shm_unlink(Q1CAM_SHM_NAME);
@@ -5702,12 +5758,51 @@ index 0000000..d2a6b2b
 +	free(c);
 +	*c_ptr = NULL;
 +}
++
++void
++quest1_cameras_push_imu(struct quest1_cameras *c,
++                        uint64_t timestamp_us,
++                        const float accel[3],
++                        const float gyro[3],
++                        float temperature,
++                        int64_t imu_to_monotonic_ns)
++{
++	if (c == NULL) {
++		return;
++	}
++	struct q1cam_shm *shm = c->shm;
++	uint64_t n = shm->imu_latest + 1; // only this thread writes
++	struct q1cam_imu_sample *e = &shm->imu[n % Q1CAM_IMU_RING];
++	__atomic_store_n(&e->seq, 0, __ATOMIC_RELAXED);
++	__atomic_thread_fence(__ATOMIC_RELEASE);
++	e->timestamp_ns = (int64_t)(timestamp_us * U_TIME_1US_IN_NS);
++	memcpy(e->accel, accel, sizeof(e->accel));
++	memcpy(e->gyro, gyro, sizeof(e->gyro));
++	e->temperature = temperature;
++	__atomic_store_n(&e->seq, n, __ATOMIC_RELEASE);
++	__atomic_store_n(&shm->imu_to_monotonic_ns, imu_to_monotonic_ns, __ATOMIC_RELAXED);
++	__atomic_store_n(&shm->imu_latest, n, __ATOMIC_RELEASE);
++}
++
++void
++quest1_cameras_push_shutter(struct quest1_cameras *c, uint64_t timestamp_us, uint8_t sync_id)
++{
++	if (c == NULL) {
++		return;
++	}
++	os_mutex_lock(&c->shutter_mutex);
++	uint32_t k = c->shutter_head++ % CAM_SHUTTER_RING;
++	c->shutter[k].ts_us = timestamp_us;
++	c->shutter[k].recv_ns = os_monotonic_get_ns();
++	c->shutter[k].sync_id = sync_id;
++	os_mutex_unlock(&c->shutter_mutex);
++}
 diff --git a/src/xrt/drivers/quest1/quest1_cameras_shm.h b/src/xrt/drivers/quest1/quest1_cameras_shm.h
 new file mode 100644
-index 0000000..25f98d0
+index 0000000..875f6a0
 --- /dev/null
 +++ b/src/xrt/drivers/quest1/quest1_cameras_shm.h
-@@ -0,0 +1,62 @@
+@@ -0,0 +1,84 @@
 +// Copyright 2026, Quest1-SteamOS contributors
 +// SPDX-License-Identifier: BSL-1.0
 +/*!
@@ -5715,8 +5810,13 @@ index 0000000..25f98d0
 + * @brief  Shared-memory layout of the tracking camera frames that the quest1 driver publishes
 + *         (QUEST1_CAMERAS=0 turns it off). Plain C, no Monado headers: clients include it directly.
 + *
-+ * The writer fills slot (n % Q1CAM_SLOTS), sets its seq to n, then stores latest = n (release).
-+ * A reader loads latest (acquire), copies that slot and checks that its seq is still n.
++ * The writer clears slot (n % Q1CAM_SLOTS)'s seq, fills the slot, sets its seq to n, then stores
++ * latest = n (release). A reader loads latest (acquire), copies that slot and checks that its seq
++ * is still n. The IMU ring works the same way, one sample per entry: imu[n % Q1CAM_IMU_RING].
++ *
++ * Two clocks: CLOCK_MONOTONIC (the ISP frame timestamps) and the SyncBoss MCU clock (IMU samples
++ * and camera shutter times, in ns here). imu_to_monotonic_ns is the driver's current mapping,
++ * monotonic = IMU clock + imu_to_monotonic_ns (smallest delivery delay, follows drift slowly).
 + *
 + * The cameras run only on demand: a reader stores CLOCK_MONOTONIC ns into demand_ns at least every
 + * 0.5 s (the region is root-only, open it O_RDWR). The driver powers the cameras up when demand_ns
@@ -5731,11 +5831,12 @@ index 0000000..25f98d0
 +
 +#define Q1CAM_SHM_NAME "/quest1-cameras"
 +#define Q1CAM_MAGIC 0x314d4351u // "QCM1"
-+#define Q1CAM_VERSION 2
++#define Q1CAM_VERSION 3
 +#define Q1CAM_N 4
 +#define Q1CAM_W 640
 +#define Q1CAM_H 480
 +#define Q1CAM_SLOTS 3
++#define Q1CAM_IMU_RING 4096 // about 4 s at 1 kHz
 +
 +//! Factory calibration from /persist/calibration/camera_calibration_v2.json.
 +struct q1cam_calib
@@ -5751,11 +5852,24 @@ index 0000000..25f98d0
 +struct q1cam_slot
 +{
 +	uint64_t seq;
-+	int64_t timestamp_ns; //!< CLOCK_MONOTONIC capture time (ISP timestamp of camera 0)
++	int64_t timestamp_ns; //!< CLOCK_MONOTONIC ISP timestamp of camera 0 (frame end, not exposure)
++	int64_t shutter_ns;   //!< SyncBoss shutter time, IMU clock; 0 if no shutter record matched
 +	uint16_t exposure_us[Q1CAM_N];
 +	uint8_t gain_x16[Q1CAM_N];
-+	uint8_t pad[4];
++	uint8_t sync_id; //!< frame-sync id from the metadata line (4 bits)
++	uint8_t pad[3];
 +	uint8_t pixels[Q1CAM_N][Q1CAM_W * Q1CAM_H]; //!< Y8, index = calibration Id
++};
++
++//! Headset IMU sample as SyncBoss delivers it (1 kHz, IMU sensor axes, no calibration applied).
++struct q1cam_imu_sample
++{
++	uint64_t seq;
++	int64_t timestamp_ns; //!< IMU clock
++	float accel[3];       //!< m/s^2
++	float gyro[3];        //!< rad/s
++	float temperature;    //!< deg C
++	uint32_t pad;
 +};
 +
 +struct q1cam_shm
@@ -5767,15 +5881,18 @@ index 0000000..25f98d0
 +	struct q1cam_calib calib[Q1CAM_N];
 +	uint64_t latest;    //!< 0 = no frame yet
 +	uint64_t demand_ns; //!< written by readers: CLOCK_MONOTONIC of their last heartbeat
-+	uint64_t pad2[6];
++	uint64_t imu_latest;         //!< 0 = no IMU sample yet
++	int64_t imu_to_monotonic_ns; //!< see above
++	uint64_t pad2[4];
 +	struct q1cam_slot slot[Q1CAM_SLOTS];
++	struct q1cam_imu_sample imu[Q1CAM_IMU_RING];
 +};
 diff --git a/src/xrt/drivers/quest1/quest1_hmd.c b/src/xrt/drivers/quest1/quest1_hmd.c
 new file mode 100644
-index 0000000..6e443b7
+index 0000000..866c87d
 --- /dev/null
 +++ b/src/xrt/drivers/quest1/quest1_hmd.c
-@@ -0,0 +1,773 @@
+@@ -0,0 +1,794 @@
 +// Copyright 2026, Quest1-SteamOS contributors
 +// SPDX-License-Identifier: BSL-1.0
 +/*!
@@ -5884,9 +6001,20 @@ index 0000000..6e443b7
 +	uint8_t pad[7];
 +};
 +
++//! Record type 14: camera shutter (process_camera_shutter_v2, src/qcam/qcam.c).
++struct sb_camera_shutter
++{
++	uint8_t b0;
++	uint8_t pad[7];
++	uint64_t timestamp_us; // MCU clock, shared with the IMU
++	uint32_t unknown;
++	uint8_t sync_id; // matches the frame metadata's sync id (4 bits)
++};
++
 +#define SB_RECORD_HEADSET_IMU 0
 +#define SB_RECORD_CONTROLLER_IMU 3
 +#define SB_RECORD_CONTROLLER_INPUT 8
++#define SB_RECORD_CAMERA_SHUTTER 14
 +
 +//! syncboss_input_device_info_t, 0x148 bytes.
 +struct sb_input_device_info
@@ -6092,6 +6220,9 @@ index 0000000..6e443b7
 +	    XRT_SPACE_RELATION_ANGULAR_VELOCITY_VALID_BIT | XRT_SPACE_RELATION_POSITION_VALID_BIT);
 +	m_relation_history_push(h->history, &rel, (int64_t)imu_ns + h->imu.clock_offset_ns);
 +
++	quest1_cameras_push_imu(__atomic_load_n(&h->cameras, __ATOMIC_ACQUIRE), e->timestamp_us, e->accel, e->gyro,
++	                        e->temperature, h->imu.clock_offset_ns);
++
 +	if (h->imu.samples % 5000 == 0) {
 +		Q1_DEBUG(h, "imu %llu samples, bias [%.4f %.4f %.4f], %.1f °C",
 +		         (unsigned long long)h->imu.samples, h->imu.gyro_bias.x, h->imu.gyro_bias.y,
@@ -6245,6 +6376,11 @@ index 0000000..6e443b7
 +			struct sb_imu_event e;
 +			memcpy(&e, rec.data, sizeof(e));
 +			handle_imu(h, &e);
++		} else if (r == 0 && rec.type == SB_RECORD_CAMERA_SHUTTER) {
++			struct sb_camera_shutter e;
++			memcpy(&e, rec.data, sizeof(e));
++			quest1_cameras_push_shutter(__atomic_load_n(&h->cameras, __ATOMIC_ACQUIRE), e.timestamp_us,
++			                            e.sync_id);
 +		} else if (r == 0 && rec.type == SB_RECORD_CONTROLLER_IMU && h->ctrl[0] != NULL) {
 +			struct sb_ctrl_imu e;
 +			memcpy(&e, rec.data, sizeof(e));
@@ -6308,9 +6444,11 @@ index 0000000..6e443b7
 +		h->sb.input_stop(h->sb_handle);
 +		os_nanosleep(300 * U_TIME_1MS_IN_NS); // the stop goes out while the IMU thread still pumps
 +	}
-+	// The camera commands need the IMU thread to keep pumping the stream.
-+	quest1_cameras_destroy(&h->cameras);
++	// The camera commands need the IMU thread to keep pumping the stream, which in turn feeds the
++	// cameras' shared memory until it stops.
++	quest1_cameras_stop(h->cameras);
 +	os_thread_helper_destroy(&h->oth);
++	quest1_cameras_destroy(&h->cameras);
 +	if (h->sb_handle != NULL) {
 +		if (h->sb.imu_disable != NULL) {
 +			h->sb.imu_disable(h->sb_handle);
@@ -6522,7 +6660,7 @@ index 0000000..6e443b7
 +	}
 +
 +	if (debug_get_bool_option_quest1_cameras()) {
-+		h->cameras = quest1_cameras_start(h->sb_handle, h->log_level);
++		__atomic_store_n(&h->cameras, quest1_cameras_start(h->sb_handle, h->log_level), __ATOMIC_RELEASE);
 +	}
 +
 +	u_var_add_root(h, "Quest 1 HMD", true);
@@ -6551,10 +6689,10 @@ index 0000000..6e443b7
 +}
 diff --git a/src/xrt/drivers/quest1/quest1_interface.h b/src/xrt/drivers/quest1/quest1_interface.h
 new file mode 100644
-index 0000000..b931354
+index 0000000..23734bc
 --- /dev/null
 +++ b/src/xrt/drivers/quest1/quest1_interface.h
-@@ -0,0 +1,108 @@
+@@ -0,0 +1,125 @@
 +// Copyright 2026, Quest1-SteamOS contributors
 +// SPDX-License-Identifier: BSL-1.0
 +/*!
@@ -6630,8 +6768,25 @@ index 0000000..b931354
 +struct quest1_cameras *
 +quest1_cameras_start(void *sb_handle, enum u_logging_level log_level);
 +
++//! Stops the camera thread (and the cameras); the IMU thread may still push. c may be NULL.
++void
++quest1_cameras_stop(struct quest1_cameras *c);
++
 +void
 +quest1_cameras_destroy(struct quest1_cameras **c_ptr);
++
++//! Called from the IMU thread for every headset IMU sample (raw, IMU clock); c may be NULL.
++void
++quest1_cameras_push_imu(struct quest1_cameras *c,
++                        uint64_t timestamp_us,
++                        const float accel[3],
++                        const float gyro[3],
++                        float temperature,
++                        int64_t imu_to_monotonic_ns);
++
++//! Called from the IMU thread for every SyncBoss camera shutter record; c may be NULL.
++void
++quest1_cameras_push_shutter(struct quest1_cameras *c, uint64_t timestamp_us, uint8_t sync_id);
 +
 +struct quest1_controller;
 +

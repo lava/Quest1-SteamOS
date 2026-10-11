@@ -106,9 +106,20 @@ struct sb_ctrl_input
 	uint8_t pad[7];
 };
 
+//! Record type 14: camera shutter (process_camera_shutter_v2, src/qcam/qcam.c).
+struct sb_camera_shutter
+{
+	uint8_t b0;
+	uint8_t pad[7];
+	uint64_t timestamp_us; // MCU clock, shared with the IMU
+	uint32_t unknown;
+	uint8_t sync_id; // matches the frame metadata's sync id (4 bits)
+};
+
 #define SB_RECORD_HEADSET_IMU 0
 #define SB_RECORD_CONTROLLER_IMU 3
 #define SB_RECORD_CONTROLLER_INPUT 8
+#define SB_RECORD_CAMERA_SHUTTER 14
 
 //! syncboss_input_device_info_t, 0x148 bytes.
 struct sb_input_device_info
@@ -314,6 +325,9 @@ handle_imu(struct quest1_hmd *h, const struct sb_imu_event *e)
 	    XRT_SPACE_RELATION_ANGULAR_VELOCITY_VALID_BIT | XRT_SPACE_RELATION_POSITION_VALID_BIT);
 	m_relation_history_push(h->history, &rel, (int64_t)imu_ns + h->imu.clock_offset_ns);
 
+	quest1_cameras_push_imu(__atomic_load_n(&h->cameras, __ATOMIC_ACQUIRE), e->timestamp_us, e->accel, e->gyro,
+	                        e->temperature, h->imu.clock_offset_ns);
+
 	if (h->imu.samples % 5000 == 0) {
 		Q1_DEBUG(h, "imu %llu samples, bias [%.4f %.4f %.4f], %.1f °C",
 		         (unsigned long long)h->imu.samples, h->imu.gyro_bias.x, h->imu.gyro_bias.y,
@@ -467,6 +481,11 @@ imu_thread(void *ptr)
 			struct sb_imu_event e;
 			memcpy(&e, rec.data, sizeof(e));
 			handle_imu(h, &e);
+		} else if (r == 0 && rec.type == SB_RECORD_CAMERA_SHUTTER) {
+			struct sb_camera_shutter e;
+			memcpy(&e, rec.data, sizeof(e));
+			quest1_cameras_push_shutter(__atomic_load_n(&h->cameras, __ATOMIC_ACQUIRE), e.timestamp_us,
+			                            e.sync_id);
 		} else if (r == 0 && rec.type == SB_RECORD_CONTROLLER_IMU && h->ctrl[0] != NULL) {
 			struct sb_ctrl_imu e;
 			memcpy(&e, rec.data, sizeof(e));
@@ -530,9 +549,11 @@ hmd_destroy(struct xrt_device *xdev)
 		h->sb.input_stop(h->sb_handle);
 		os_nanosleep(300 * U_TIME_1MS_IN_NS); // the stop goes out while the IMU thread still pumps
 	}
-	// The camera commands need the IMU thread to keep pumping the stream.
-	quest1_cameras_destroy(&h->cameras);
+	// The camera commands need the IMU thread to keep pumping the stream, which in turn feeds the
+	// cameras' shared memory until it stops.
+	quest1_cameras_stop(h->cameras);
 	os_thread_helper_destroy(&h->oth);
+	quest1_cameras_destroy(&h->cameras);
 	if (h->sb_handle != NULL) {
 		if (h->sb.imu_disable != NULL) {
 			h->sb.imu_disable(h->sb_handle);
@@ -744,7 +765,7 @@ quest1_hmd_create(void)
 	}
 
 	if (debug_get_bool_option_quest1_cameras()) {
-		h->cameras = quest1_cameras_start(h->sb_handle, h->log_level);
+		__atomic_store_n(&h->cameras, quest1_cameras_start(h->sb_handle, h->log_level), __ATOMIC_RELEASE);
 	}
 
 	u_var_add_root(h, "Quest 1 HMD", true);

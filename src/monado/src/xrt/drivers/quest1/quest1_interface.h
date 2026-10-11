@@ -73,8 +73,25 @@ struct quest1_cameras;
 struct quest1_cameras *
 quest1_cameras_start(void *sb_handle, enum u_logging_level log_level);
 
+//! Stops the camera thread (and the cameras); the IMU thread may still push. c may be NULL.
+void
+quest1_cameras_stop(struct quest1_cameras *c);
+
 void
 quest1_cameras_destroy(struct quest1_cameras **c_ptr);
+
+//! Called from the IMU thread for every headset IMU sample (raw, IMU clock); c may be NULL.
+void
+quest1_cameras_push_imu(struct quest1_cameras *c,
+                        uint64_t timestamp_us,
+                        const float accel[3],
+                        const float gyro[3],
+                        float temperature,
+                        int64_t imu_to_monotonic_ns);
+
+//! Called from the IMU thread for every SyncBoss camera shutter record; c may be NULL.
+void
+quest1_cameras_push_shutter(struct quest1_cameras *c, uint64_t timestamp_us, uint8_t sync_id);
 
 struct quest1_controller;
 

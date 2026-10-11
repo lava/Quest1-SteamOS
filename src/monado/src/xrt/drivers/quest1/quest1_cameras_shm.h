@@ -5,8 +5,13 @@
  * @brief  Shared-memory layout of the tracking camera frames that the quest1 driver publishes
  *         (QUEST1_CAMERAS=0 turns it off). Plain C, no Monado headers: clients include it directly.
  *
- * The writer fills slot (n % Q1CAM_SLOTS), sets its seq to n, then stores latest = n (release).
- * A reader loads latest (acquire), copies that slot and checks that its seq is still n.
+ * The writer clears slot (n % Q1CAM_SLOTS)'s seq, fills the slot, sets its seq to n, then stores
+ * latest = n (release). A reader loads latest (acquire), copies that slot and checks that its seq
+ * is still n. The IMU ring works the same way, one sample per entry: imu[n % Q1CAM_IMU_RING].
+ *
+ * Two clocks: CLOCK_MONOTONIC (the ISP frame timestamps) and the SyncBoss MCU clock (IMU samples
+ * and camera shutter times, in ns here). imu_to_monotonic_ns is the driver's current mapping,
+ * monotonic = IMU clock + imu_to_monotonic_ns (smallest delivery delay, follows drift slowly).
  *
  * The cameras run only on demand: a reader stores CLOCK_MONOTONIC ns into demand_ns at least every
  * 0.5 s (the region is root-only, open it O_RDWR). The driver powers the cameras up when demand_ns
@@ -21,11 +26,12 @@
 
 #define Q1CAM_SHM_NAME "/quest1-cameras"
 #define Q1CAM_MAGIC 0x314d4351u // "QCM1"
-#define Q1CAM_VERSION 2
+#define Q1CAM_VERSION 3
 #define Q1CAM_N 4
 #define Q1CAM_W 640
 #define Q1CAM_H 480
 #define Q1CAM_SLOTS 3
+#define Q1CAM_IMU_RING 4096 // about 4 s at 1 kHz
 
 //! Factory calibration from /persist/calibration/camera_calibration_v2.json.
 struct q1cam_calib
@@ -41,11 +47,24 @@ struct q1cam_calib
 struct q1cam_slot
 {
 	uint64_t seq;
-	int64_t timestamp_ns; //!< CLOCK_MONOTONIC capture time (ISP timestamp of camera 0)
+	int64_t timestamp_ns; //!< CLOCK_MONOTONIC ISP timestamp of camera 0 (frame end, not exposure)
+	int64_t shutter_ns;   //!< SyncBoss shutter time, IMU clock; 0 if no shutter record matched
 	uint16_t exposure_us[Q1CAM_N];
 	uint8_t gain_x16[Q1CAM_N];
-	uint8_t pad[4];
+	uint8_t sync_id; //!< frame-sync id from the metadata line (4 bits)
+	uint8_t pad[3];
 	uint8_t pixels[Q1CAM_N][Q1CAM_W * Q1CAM_H]; //!< Y8, index = calibration Id
+};
+
+//! Headset IMU sample as SyncBoss delivers it (1 kHz, IMU sensor axes, no calibration applied).
+struct q1cam_imu_sample
+{
+	uint64_t seq;
+	int64_t timestamp_ns; //!< IMU clock
+	float accel[3];       //!< m/s^2
+	float gyro[3];        //!< rad/s
+	float temperature;    //!< deg C
+	uint32_t pad;
 };
 
 struct q1cam_shm
@@ -57,6 +76,9 @@ struct q1cam_shm
 	struct q1cam_calib calib[Q1CAM_N];
 	uint64_t latest;    //!< 0 = no frame yet
 	uint64_t demand_ns; //!< written by readers: CLOCK_MONOTONIC of their last heartbeat
-	uint64_t pad2[6];
+	uint64_t imu_latest;         //!< 0 = no IMU sample yet
+	int64_t imu_to_monotonic_ns; //!< see above
+	uint64_t pad2[4];
 	struct q1cam_slot slot[Q1CAM_SLOTS];
+	struct q1cam_imu_sample imu[Q1CAM_IMU_RING];
 };

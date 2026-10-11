@@ -2,16 +2,24 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  Native Quest 1 HMD: 3DoF from the SyncBoss IMU, display for the 2880x1600 framebuffer.
+ * @brief  Native Quest 1 HMD: 3DoF from the SyncBoss IMU, 6DoF with SLAM on the tracking cameras,
+ *         display for the 2880x1600 framebuffer.
  *
  * libsyncboss.so is Meta's bionic C library for the SyncBoss MCU; it is loaded
  * with libhybris (the process needs LD_PRELOAD=libbionictls.so). Records come
  * from a 32-entry ring at 1 kHz; layouts are in docs/syncboss-imu.md.
  *
+ * The IMU samples are rectified with Meta's calibration (quest1_calib.c) into the device frame
+ * (+X right, +Y up, +Z back). With SLAM (quest1_slam.c, Basalt) the head pose comes from the
+ * tracker; until its first pose, or without it, from the 3DoF fusion. Frames and IMU samples
+ * both carry SyncBoss (MCU) times, mapped to CLOCK_MONOTONIC with the same offset.
+ *
  * @ingroup drv_quest1
  */
 
 #include "quest1_interface.h"
+#include "quest1_calib.h"
+#include "quest1_slam.h"
 
 #include "math/m_api.h"
 #include "math/m_imu_3dof.h"
@@ -39,11 +47,23 @@ extern void *
 android_dlsym(void *handle, const char *symbol);
 
 DEBUG_GET_ONCE_LOG_OPTION(quest1_log, "QUEST1_LOG", U_LOGGING_INFO)
-// Head axis i = sign * IMU axis, e.g. "-y,x,z". Head frame: +X right, +Y up, +Z back.
-// Calibrated on the device 2026-10-05: up = -x, look-down = +y, turn-left = -x, tilt-left = -z (IMU frame).
-DEBUG_GET_ONCE_OPTION(quest1_imu_axes, "QUEST1_IMU_AXES", "-y,-x,-z")
+// Overrides the factory IMU rectification for the 3DoF fusion: head axis i = sign * raw IMU axis,
+// e.g. "-y,x,z". Head frame: +X right, +Y up, +Z back. Calibrated by hand on the device
+// 2026-10-05 as "-y,-x,-z" (up = -x, look-down = +y, turn-left = -x, tilt-left = -z), which is
+// what the factory rectification matrices are up to ~1%; that remap is also the fallback when
+// /persist/calibration cannot be read.
+DEBUG_GET_ONCE_OPTION(quest1_imu_axes, "QUEST1_IMU_AXES", NULL)
+#define Q1_FALLBACK_IMU_AXES "-y,-x,-z"
 DEBUG_GET_ONCE_BOOL_OPTION(quest1_controllers, "QUEST1_CONTROLLERS", true)
 DEBUG_GET_ONCE_BOOL_OPTION(quest1_cameras, "QUEST1_CAMERAS", true)
+//! 6DoF tracking with Basalt (needs QUEST1_CAMERAS and the calibration); falls back to 3DoF.
+DEBUG_GET_ONCE_BOOL_OPTION(quest1_slam, "QUEST1_SLAM", true)
+//! Calibration ids fed to SLAM in order; the first two must be the bottom stereo pair 0,2. "0,2,1,3" = all four.
+DEBUG_GET_ONCE_OPTION(quest1_slam_cams, "QUEST1_SLAM_CAMS", "0,2")
+//! Frame rate given to SLAM: 30 / QUEST1_SLAM_FRAME_DIVIDER Hz. Basalt's optical flow takes ~70 ms
+//! of CPU per stereo frameset on the SD835 and cannot keep up with 30 Hz; 15 Hz tracks as well
+//! offline (walking dataset).
+DEBUG_GET_ONCE_NUM_OPTION(quest1_slam_frame_divider, "QUEST1_SLAM_FRAME_DIVIDER", 2)
 
 #define Q1_TRACE(h, ...) U_LOG_XDEV_IFL_T(&h->base, h->log_level, __VA_ARGS__)
 #define Q1_DEBUG(h, ...) U_LOG_XDEV_IFL_D(&h->base, h->log_level, __VA_ARGS__)
@@ -194,7 +214,12 @@ struct quest1_hmd
 	void *sb_handle;
 	struct os_thread_helper oth;
 
-	//! IMU axis remap: head[i] = axis_sign[i] * imu[axis_index[i]].
+	//! Meta's calibration from /persist; have_calib false if unreadable.
+	struct quest1_calib calib;
+	bool have_calib;
+
+	//! 3DoF without the rectification: head[i] = axis_sign[i] * imu[axis_index[i]].
+	bool raw_axes;
 	int axis_index[3];
 	float axis_sign[3];
 
@@ -205,8 +230,8 @@ struct quest1_hmd
 		struct xrt_vec3 gyro_bias;
 		uint64_t still_since_ns;
 		bool bias_valid;
-		int64_t clock_offset_ns; //!< monotonic - IMU clock
-		bool have_offset;
+		int64_t clock_offset_ns; //!< monotonic - IMU clock; read by the camera thread too (atomic)
+		bool have_offset;        //!< atomic
 		uint64_t samples;
 	} imu;
 
@@ -226,6 +251,10 @@ struct quest1_hmd
 
 	//! Tracking cameras, streamed on demand; NULL with QUEST1_CAMERAS=0.
 	struct quest1_cameras *cameras;
+
+	//! 6DoF tracker; NULL without SLAM. Set before the cameras start, read by the IMU thread (atomic).
+	struct quest1_slam *slam;
+	struct quest1_slam *slam_unused; //!< started, but the cameras did not; destroyed with the device
 };
 
 static inline struct quest1_hmd *
@@ -301,15 +330,23 @@ handle_imu(struct quest1_hmd *h, const struct sb_imu_event *e)
 	// The IMU clock is the MCU's: map it to monotonic with the smallest observed
 	// delivery delay, letting it creep up slowly to follow drift.
 	int64_t offset = now - (int64_t)imu_ns;
-	if (!h->imu.have_offset || offset < h->imu.clock_offset_ns) {
-		h->imu.clock_offset_ns = offset;
-		h->imu.have_offset = true;
+	int64_t clock_offset = h->imu.clock_offset_ns;
+	if (!h->imu.have_offset || offset < clock_offset) {
+		clock_offset = offset;
 	} else {
-		h->imu.clock_offset_ns += (offset - h->imu.clock_offset_ns) / 4096;
+		clock_offset += (offset - clock_offset) / 4096;
 	}
+	__atomic_store_n(&h->imu.clock_offset_ns, clock_offset, __ATOMIC_RELEASE);
+	__atomic_store_n(&h->imu.have_offset, true, __ATOMIC_RELEASE);
 
-	struct xrt_vec3 accel = remap(h, e->accel);
-	struct xrt_vec3 gyro = remap(h, e->gyro);
+	struct xrt_vec3 rect_accel = {0}, rect_gyro = {0};
+	if (h->have_calib) {
+		quest1_calib_rectify_imu(&h->calib.imu, e->temperature, e->accel, e->gyro, &rect_accel, &rect_gyro);
+		quest1_slam_push_imu(__atomic_load_n(&h->slam, __ATOMIC_ACQUIRE), (int64_t)imu_ns + clock_offset,
+		                     &rect_accel, &rect_gyro);
+	}
+	struct xrt_vec3 accel = h->raw_axes ? remap(h, e->accel) : rect_accel;
+	struct xrt_vec3 gyro = h->raw_axes ? remap(h, e->gyro) : rect_gyro;
 	update_gyro_bias(h, imu_ns, &accel, &gyro);
 	struct xrt_vec3 gyro_unbiased = m_vec3_sub(gyro, h->imu.gyro_bias);
 
@@ -333,6 +370,38 @@ handle_imu(struct quest1_hmd *h, const struct sb_imu_event *e)
 		         (unsigned long long)h->imu.samples, h->imu.gyro_bias.x, h->imu.gyro_bias.y,
 		         h->imu.gyro_bias.z, e->temperature);
 	}
+}
+
+//! Camera thread: a HEADSET frameset for SLAM, on the IMU's monotonic mapping.
+static void
+on_frameset(void *data, int64_t shutter_ns, const uint8_t *const pixels[4])
+{
+	struct quest1_hmd *h = data;
+	if (!__atomic_load_n(&h->imu.have_offset, __ATOMIC_ACQUIRE)) {
+		return;
+	}
+	int64_t offset = __atomic_load_n(&h->imu.clock_offset_ns, __ATOMIC_ACQUIRE);
+	quest1_slam_push_frameset(h->slam, shutter_ns + offset, pixels);
+}
+
+static bool
+parse_slam_cams(const char *spec, int ids[QUEST1_CALIB_CAMS], int *count)
+{
+	*count = 0;
+	unsigned seen = 0;
+	for (const char *p = spec; *p != '\0';) {
+		if (*p < '0' || *p > '3' || *count == QUEST1_CALIB_CAMS || (seen & (1u << (*p - '0')))) {
+			return false;
+		}
+		seen |= 1u << (*p - '0');
+		ids[(*count)++] = *p++ - '0';
+		if (*p == ',') {
+			p++;
+		} else if (*p != '\0') {
+			return false;
+		}
+	}
+	return *count >= 2;
 }
 
 static int
@@ -519,6 +588,9 @@ hmd_get_tracked_pose(struct xrt_device *xdev,
 		U_LOG_XDEV_UNSUPPORTED_INPUT(&h->base, h->log_level, name);
 		return XRT_ERROR_INPUT_UNSUPPORTED;
 	}
+	if (quest1_slam_get_pose(h->slam, at_timestamp_ns, out_relation)) {
+		return XRT_SUCCESS;
+	}
 	struct xrt_space_relation rel = XRT_SPACE_RELATION_ZERO;
 	if (m_relation_history_get(h->history, at_timestamp_ns, &rel) == M_RELATION_HISTORY_RESULT_INVALID) {
 		rel.pose.orientation.w = 1.0f;
@@ -554,6 +626,8 @@ hmd_destroy(struct xrt_device *xdev)
 	quest1_cameras_stop(h->cameras);
 	os_thread_helper_destroy(&h->oth);
 	quest1_cameras_destroy(&h->cameras);
+	quest1_slam_destroy(&h->slam); // after the IMU and camera threads, which feed it
+	quest1_slam_destroy(&h->slam_unused);
 	if (h->sb_handle != NULL) {
 		if (h->sb.imu_disable != NULL) {
 			h->sb.imu_disable(h->sb_handle);
@@ -721,8 +795,13 @@ quest1_hmd_create(void)
 	os_mutex_init(&h->ctrl_mutex);
 	setup_display(h);
 
+	h->have_calib = quest1_calib_load(&h->calib, h->log_level);
 	const char *axes = debug_get_option_quest1_imu_axes();
-	if (!parse_axes(h, axes)) {
+	h->raw_axes = axes != NULL || !h->have_calib;
+	if (axes == NULL) {
+		axes = Q1_FALLBACK_IMU_AXES;
+	}
+	if (h->raw_axes && !parse_axes(h, axes)) {
 		Q1_ERROR(h, "bad QUEST1_IMU_AXES '%s', expected e.g. '-y,x,z'", axes);
 		goto err;
 	}
@@ -764,16 +843,41 @@ quest1_hmd_create(void)
 		}
 	}
 
-	if (debug_get_bool_option_quest1_cameras()) {
-		__atomic_store_n(&h->cameras, quest1_cameras_start(h->sb_handle, h->log_level), __ATOMIC_RELEASE);
+	if (debug_get_bool_option_quest1_cameras() && debug_get_bool_option_quest1_slam() && h->have_calib) {
+		int ids[QUEST1_CALIB_CAMS], count;
+		const char *spec = debug_get_option_quest1_slam_cams();
+		if (!parse_slam_cams(spec, ids, &count)) {
+			Q1_ERROR(h, "bad QUEST1_SLAM_CAMS '%s', expected e.g. '0,2' or '0,2,1,3'", spec);
+		} else {
+			if (ids[0] != 0 || ids[1] != 2) {
+				Q1_ERROR(h, "QUEST1_SLAM_CAMS '%s': Basalt's cam0/cam1 should be the stereo pair 0,2", spec);
+			}
+			__atomic_store_n(&h->slam, quest1_slam_create(&h->calib, ids, count,
+			                                    (int)debug_get_num_option_quest1_slam_frame_divider(),
+			                                    h->log_level),
+			                 __ATOMIC_RELEASE);
+		}
 	}
+	if (debug_get_bool_option_quest1_cameras()) {
+		struct quest1_cameras *cams =
+		    quest1_cameras_start(h->sb_handle, h->log_level, h->slam != NULL ? on_frameset : NULL, h);
+		__atomic_store_n(&h->cameras, cams, __ATOMIC_RELEASE);
+		if (cams == NULL && h->slam != NULL) {
+			// No frames for SLAM: stop using it; the IMU thread may still be pushing to it.
+			h->slam_unused = __atomic_exchange_n(&h->slam, NULL, __ATOMIC_ACQ_REL);
+		}
+	}
+	h->base.supported.position_tracking = h->slam != NULL;
+	snprintf(h->base.tracking_origin->name, XRT_TRACKING_NAME_LEN, "%s",
+	         h->slam != NULL ? "Quest 1 SLAM" : "Quest 1 IMU");
 
 	u_var_add_root(h, "Quest 1 HMD", true);
 	u_var_add_log_level(h, &h->log_level, "log_level");
 	u_var_add_ro_vec3_f32(h, &h->imu.gyro_bias, "gyro_bias");
 	m_imu_3dof_add_vars(&h->imu.fusion, h, "fusion.");
 
-	Q1_INFO(h, "IMU running (axes %s)", axes);
+	Q1_INFO(h, "IMU running (%s%s), %s", h->raw_axes ? "axes " : "factory rectification",
+	        h->raw_axes ? axes : "", h->slam != NULL ? "6DoF with SLAM" : "3DoF");
 	return &h->base;
 
 err:

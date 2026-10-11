@@ -34,6 +34,49 @@ index 6556fa7..78f6aea 100644
  include(CompilerFlags.cmake)
  
  # Default to PIC code
+diff --git a/src/xrt/auxiliary/tracking/t_tracker_slam.cpp b/src/xrt/auxiliary/tracking/t_tracker_slam.cpp
+index fe5ca6d..3bda925 100644
+--- a/src/xrt/auxiliary/tracking/t_tracker_slam.cpp
++++ b/src/xrt/auxiliary/tracking/t_tracker_slam.cpp
+@@ -1415,6 +1415,18 @@ t_slam_start(struct xrt_tracked_slam *xts)
+ 	return 0;
+ }
+ 
++extern "C" int
++t_slam_reset(struct xrt_tracked_slam *xts)
++{
++	auto &t = *container_of(xts, TrackerSlam, base);
++	vit_result_t vres = t.vit.tracker_reset(t.tracker);
++	if (vres != VIT_SUCCESS) {
++		SLAM_WARN("Failed to reset VIT tracker");
++		return -1;
++	}
++	return 0;
++}
++
+ extern "C" void
+ t_slam_fill_default_config(struct t_slam_tracker_config *config)
+ {
+diff --git a/src/xrt/auxiliary/tracking/t_tracking.h b/src/xrt/auxiliary/tracking/t_tracking.h
+index de87fa0..a8449cb 100644
+--- a/src/xrt/auxiliary/tracking/t_tracking.h
++++ b/src/xrt/auxiliary/tracking/t_tracking.h
+@@ -732,6 +732,15 @@ t_slam_create(struct xrt_frame_context *xfctx,
+ int
+ t_slam_start(struct xrt_tracked_slam *xts);
+ 
++/*!
++ * Asks the SLAM system to reset its state (as the debug UI button does); the next poses start
++ * from a new world origin.
++ *
++ * @public @memberof xrt_tracked_slam
++ */
++int
++t_slam_reset(struct xrt_tracked_slam *xts);
++
+ /*
+  *
+  * Camera calibration
 diff --git a/src/xrt/auxiliary/util/CMakeLists.txt b/src/xrt/auxiliary/util/CMakeLists.txt
 index d42a418..e0e5a70 100644
 --- a/src/xrt/auxiliary/util/CMakeLists.txt
@@ -3768,18 +3811,30 @@ index 0000000..f5a1ec7
 +
 +#endif
 diff --git a/src/xrt/drivers/CMakeLists.txt b/src/xrt/drivers/CMakeLists.txt
-index 5ec9910..514459a 100644
+index 5ec9910..bb751f2 100644
 --- a/src/xrt/drivers/CMakeLists.txt
 +++ b/src/xrt/drivers/CMakeLists.txt
-@@ -698,3 +698,19 @@ if(ENABLED_HEADSET_DRIVERS)
+@@ -698,3 +698,31 @@ if(ENABLED_HEADSET_DRIVERS)
  else()
  	message(FATAL_ERROR "You must enable at least one headset driver to build Monado.")
  endif()
 +
 +if(XRT_BUILD_DRIVER_QUEST1)
-+	add_library(drv_quest1 STATIC quest1/quest1_hmd.c quest1/quest1_controller.c quest1/quest1_cameras.c quest1/quest1_interface.h)
++	add_library(
++		drv_quest1 STATIC
++		quest1/quest1_hmd.c
++		quest1/quest1_controller.c
++		quest1/quest1_cameras.c
++		quest1/quest1_calib.c
++		quest1/quest1_calib.h
++		quest1/quest1_slam.c
++		quest1/quest1_slam.h
++		quest1/quest1_interface.h
++		)
 +	target_include_directories(drv_quest1 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-+	target_link_libraries(drv_quest1 PRIVATE xrt-interfaces aux_util aux_math aux_os)
++	target_link_libraries(
++		drv_quest1 PRIVATE xrt-interfaces aux_util aux_math aux_os aux_tracking xrt-external-cjson
++		)
 +	target_link_libraries(drv_quest1 PUBLIC -L/opt/hybris/lib -lhybris-common)
 +	list(APPEND ENABLED_HEADSET_DRIVERS quest1)
 +endif()
@@ -4732,6 +4787,1279 @@ index 0000000..9836345
 +};
 +
 +#endif
+diff --git a/src/xrt/drivers/quest1/quest1_calib.c b/src/xrt/drivers/quest1/quest1_calib.c
+new file mode 100644
+index 0000000..2605fc4
+--- /dev/null
++++ b/src/xrt/drivers/quest1/quest1_calib.c
+@@ -0,0 +1,427 @@
++// Copyright 2026, Quest1-SteamOS contributors
++// SPDX-License-Identifier: BSL-1.0
++/*!
++ * @file
++ * @brief  Quest 1 calibration: /persist/calibration JSON, Fisheye62 to KB4, IMU rectification.
++ *
++ * The same conversion as tools/quest1-basalt-prep.py, which was validated offline with Basalt.
++ *
++ * @ingroup drv_quest1
++ */
++
++#include "quest1_calib.h"
++
++#include "util/u_file.h"
++#include "util/u_json.h"
++#include "util/u_logging.h"
++
++#include <dirent.h>
++#include <math.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++
++#ifndef CALIB_DIR
++#define CALIB_DIR "/persist/calibration"
++#endif
++#define CALIB_ERROR(ll, ...) U_LOG_IFL_E(ll, "calibration: " __VA_ARGS__)
++#define CALIB_INFO(ll, ...) U_LOG_IFL_I(ll, "calibration: " __VA_ARGS__)
++
++
++/*
++ *
++ * Fisheye62 -> KB4.
++ *
++ */
++
++//! Meta's Fisheye62 (as rift_s_util.cpp): pixel of the ray at angle theta from the axis, azimuth phi.
++static void
++fisheye62_project(const struct quest1_cam_calib *c, double theta, double phi, double out[2])
++{
++	const double *d = c->fisheye62;
++	double t2 = theta * theta;
++	double radial = 1 + t2 * (d[0] + t2 * (d[1] + t2 * (d[2] + t2 * (d[3] + t2 * (d[4] + t2 * d[5])))));
++	double xp = theta * cos(phi), yp = theta * sin(phi);
++	double p1 = d[6], p2 = d[7];
++	double dx = 2 * p1 * xp * yp + p2 * (t2 + 2 * xp * xp);
++	double dy = 2 * p2 * xp * yp + p1 * (t2 + 2 * yp * yp);
++	out[0] = c->f * (xp * radial + dx) + c->cx;
++	out[1] = c->f * (yp * radial + dy) + c->cy;
++}
++
++//! Solves the 4x4 system a x = b in place (Gaussian elimination, partial pivoting).
++static bool
++solve4(double a[4][4], double b[4], double x[4])
++{
++	for (int col = 0; col < 4; col++) {
++		int piv = col;
++		for (int r = col + 1; r < 4; r++) {
++			if (fabs(a[r][col]) > fabs(a[piv][col])) {
++				piv = r;
++			}
++		}
++		if (fabs(a[piv][col]) < 1e-12) {
++			return false;
++		}
++		for (int k = 0; k < 4; k++) {
++			double t = a[col][k];
++			a[col][k] = a[piv][k];
++			a[piv][k] = t;
++		}
++		double t = b[col];
++		b[col] = b[piv];
++		b[piv] = t;
++		for (int r = col + 1; r < 4; r++) {
++			double m = a[r][col] / a[col][col];
++			for (int k = col; k < 4; k++) {
++				a[r][k] -= m * a[col][k];
++			}
++			b[r] -= m * b[col];
++		}
++	}
++	for (int r = 3; r >= 0; r--) {
++		double s = b[r];
++		for (int k = r + 1; k < 4; k++) {
++			s -= a[r][k] * x[k];
++		}
++		x[r] = s / a[r][r];
++	}
++	return true;
++}
++
++#define FIT_THETA_STEPS 200
++#define FIT_PHI_STEPS 72
++#define FIT_THETA_MAX (100.0 * M_PI / 180.0)
++
++/*!
++ * KB4 with the same f, cx, cy, fitted to the Fisheye62 pixels of the rays that land in the image
++ * (and only while the projection still grows with theta). With f fixed the model is linear in
++ * k1..k4: pixel = c + f * theta * (1 + k1 t^2 + k2 t^4 + k3 t^6 + k4 t^8) * (cos phi, sin phi).
++ */
++static bool
++fit_kb4(struct quest1_cam_calib *c)
++{
++	double ata[4][4] = {{0}}, atb[4] = {0};
++	// Residuals need a second pass; keep the samples.
++	static double samples[FIT_THETA_STEPS * FIT_PHI_STEPS][4]; // theta, phi, target x, y
++	int n = 0;
++	for (int j = 0; j < FIT_PHI_STEPS; j++) {
++		double phi = -M_PI + 2.0 * M_PI * j / (FIT_PHI_STEPS - 1);
++		double last_r = -1.0;
++		for (int i = 0; i < FIT_THETA_STEPS; i++) {
++			double theta = FIT_THETA_MAX * i / (FIT_THETA_STEPS - 1);
++			double px[2];
++			fisheye62_project(c, theta, phi, px);
++			double r = hypot(px[0] - c->cx, px[1] - c->cy);
++			if (!(r > last_r)) {
++				break; // not monotonic from here on
++			}
++			last_r = r;
++			if (px[0] < 0 || px[0] > c->width - 1 || px[1] < 0 || px[1] > c->height - 1) {
++				continue;
++			}
++			double *s = samples[n++];
++			s[0] = theta;
++			s[1] = phi;
++			s[2] = px[0];
++			s[3] = px[1];
++		}
++	}
++	for (int s = 0; s < n; s++) {
++		double theta = samples[s][0], phi = samples[s][1];
++		double t2 = theta * theta;
++		double pw[4] = {t2, t2 * t2, t2 * t2 * t2, t2 * t2 * t2 * t2};
++		double dir[2] = {cos(phi), sin(phi)};
++		double base[2] = {c->cx, c->cy};
++		for (int axis = 0; axis < 2; axis++) {
++			double g = c->f * theta * dir[axis];
++			double row[4] = {g * pw[0], g * pw[1], g * pw[2], g * pw[3]};
++			double rhs = samples[s][2 + axis] - base[axis] - g;
++			for (int a = 0; a < 4; a++) {
++				for (int b = 0; b < 4; b++) {
++					ata[a][b] += row[a] * row[b];
++				}
++				atb[a] += row[a] * rhs;
++			}
++		}
++	}
++	if (n < 10 || !solve4(ata, atb, c->kb4)) {
++		return false;
++	}
++	double sum2 = 0, worst = 0;
++	for (int s = 0; s < n; s++) {
++		double theta = samples[s][0], phi = samples[s][1];
++		double t2 = theta * theta;
++		const double *k = c->kb4;
++		double rt = theta * (1 + t2 * (k[0] + t2 * (k[1] + t2 * (k[2] + t2 * k[3]))));
++		double ex = c->f * rt * cos(phi) + c->cx - samples[s][2];
++		double ey = c->f * rt * sin(phi) + c->cy - samples[s][3];
++		double e2 = ex * ex + ey * ey;
++		sum2 += e2;
++		worst = e2 > worst ? e2 : worst;
++	}
++	c->kb4_rms_px = sqrt(sum2 / n);
++	c->kb4_max_px = sqrt(worst);
++	return true;
++}
++
++
++/*
++ *
++ * JSON.
++ *
++ */
++
++static bool
++parse_offset(const cJSON *json, struct quest1_imu_offset *o)
++{
++	memset(o, 0, sizeof(*o));
++	char model[64] = {0};
++	u_json_get_string_into_array(u_json_get(json, "Model"), model, sizeof(model));
++	if (strcmp(model, "Constant") == 0) {
++		return u_json_get_float_array(u_json_get(json, "ConstantOffset"), o->offset_at_0c, 3) == 3;
++	}
++	if (strcmp(model, "LinearTemperatureDependence") == 0) {
++		return u_json_get_float_array(u_json_get(json, "OffsetAtZeroDegC"), o->offset_at_0c, 3) == 3 &&
++		       u_json_get_float_array(u_json_get(json, "OffsetTemperatureCoefficient"), o->temp_coeff, 3) == 3;
++	}
++	if (strcmp(model, "TemperaturePiecewiseLinear") == 0) {
++		char cs[32] = "Raw";
++		u_json_get_string_into_array(u_json_get(json, "CoordinateSystem"), cs, sizeof(cs));
++		if (strcmp(cs, "Raw") != 0) {
++			return false;
++		}
++		const cJSON *pair;
++		cJSON_ArrayForEach(pair, u_json_get(json, "TemperatureOffsetPairs"))
++		{
++			if (o->pair_count == QUEST1_CALIB_MAX_PAIRS ||
++			    u_json_get_float_array(pair, o->pairs[o->pair_count], 4) != 4) {
++				return false;
++			}
++			o->pair_count++;
++		}
++		// insertion sort by temperature
++		for (int i = 1; i < o->pair_count; i++) {
++			for (int j = i; j > 0 && o->pairs[j][0] < o->pairs[j - 1][0]; j--) {
++				float t[4];
++				memcpy(t, o->pairs[j], sizeof(t));
++				memcpy(o->pairs[j], o->pairs[j - 1], sizeof(t));
++				memcpy(o->pairs[j - 1], t, sizeof(t));
++			}
++		}
++		return o->pair_count > 0;
++	}
++	return false;
++}
++
++static bool
++parse_imu(const cJSON *imu, struct quest1_imu_calib *c)
++{
++	const cJSON *acc = u_json_get(imu, "Accelerometer"), *gyr = u_json_get(imu, "Gyroscope");
++	return u_json_get_float_array(u_json_get(imu, "DeviceFromImu"), c->device_from_imu, 16) == 16 &&
++	       u_json_get_float_array(u_json_get(acc, "RectificationMatrix"), c->accel_rect, 9) == 9 &&
++	       u_json_get_float_array(u_json_get(gyr, "RectificationMatrix"), c->gyro_rect, 9) == 9 &&
++	       parse_offset(u_json_get(acc, "Offset"), &c->accel_offset) &&
++	       parse_offset(u_json_get(gyr, "Offset"), &c->gyro_offset);
++}
++
++static bool
++parse_cameras(const cJSON *cams, struct quest1_calib *out, enum u_logging_level ll)
++{
++	unsigned found = 0;
++	const cJSON *cam;
++	cJSON_ArrayForEach(cam, cams)
++	{
++		char id[8] = {0}, proj_model[32] = {0}, dist_model[32] = {0};
++		u_json_get_string_into_array(u_json_get(cam, "Id"), id, sizeof(id));
++		int i = atoi(id);
++		if (i < 0 || i >= QUEST1_CALIB_CAMS) {
++			continue;
++		}
++		struct quest1_cam_calib *c = &out->cam[i];
++		const cJSON *proj = u_json_get(cam, "Projection"), *dist = u_json_get(cam, "Distortion");
++		u_json_get_string_into_array(u_json_get(proj, "Model"), proj_model, sizeof(proj_model));
++		u_json_get_string_into_array(u_json_get(dist, "Model"), dist_model, sizeof(dist_model));
++		double p[3];
++		int size[2] = {640, 480};
++		u_json_get_int_array(u_json_get(cam, "ImageSize"), size, 2);
++		if (strcmp(proj_model, "PinholeSymmetric") != 0 || strcmp(dist_model, "Fisheye62") != 0 ||
++		    u_json_get_float_array(u_json_get(cam, "DeviceFromCamera"), c->device_from_camera, 16) != 16 ||
++		    u_json_get_double_array(u_json_get(proj, "Coefficients"), p, 3) != 3 ||
++		    u_json_get_double_array(u_json_get(dist, "Coefficients"), c->fisheye62, 8) != 8) {
++			CALIB_ERROR(ll, "camera %d: unexpected layout (%s, %s)", i, proj_model, dist_model);
++			return false;
++		}
++		c->f = p[0];
++		c->cx = p[1];
++		c->cy = p[2];
++		c->width = size[0];
++		c->height = size[1];
++		if (!fit_kb4(c)) {
++			CALIB_ERROR(ll, "camera %d: KB4 fit failed", i);
++			return false;
++		}
++		found |= 1u << i;
++	}
++	return found == (1u << QUEST1_CALIB_CAMS) - 1;
++}
++
++static cJSON *
++read_json(const char *path)
++{
++	char *text = u_file_read_content_from_path(path, NULL);
++	if (text == NULL) {
++		return NULL;
++	}
++	cJSON *root = cJSON_Parse(text);
++	free(text);
++	return root;
++}
++
++//! Newest regular file in CALIB_DIR/online, by modification time.
++static bool
++newest_online(char *path, size_t size)
++{
++	DIR *d = opendir(CALIB_DIR "/online");
++	if (d == NULL) {
++		return false;
++	}
++	time_t best = 0;
++	bool found = false;
++	struct dirent *e;
++	while ((e = readdir(d)) != NULL) {
++		char p[512];
++		struct stat st;
++		snprintf(p, sizeof(p), CALIB_DIR "/online/%s", e->d_name);
++		if (e->d_name[0] == '.' || stat(p, &st) != 0 || !S_ISREG(st.st_mode)) {
++			continue;
++		}
++		if (!found || st.st_mtime > best) {
++			best = st.st_mtime;
++			snprintf(path, size, "%s", p);
++			found = true;
++		}
++	}
++	closedir(d);
++	return found;
++}
++
++static bool
++load_online(struct quest1_calib *out, enum u_logging_level ll)
++{
++	char path[512];
++	if (!newest_online(path, sizeof(path))) {
++		return false;
++	}
++	cJSON *root = read_json(path);
++	bool ok = root != NULL && parse_cameras(u_json_get(root, "CameraCalibration"), out, ll) &&
++	          parse_imu(u_json_get(root, "ImuCalibration"), &out->imu);
++	cJSON_Delete(root);
++	if (ok) {
++		snprintf(out->source, sizeof(out->source), "%s", path);
++	} else {
++		CALIB_ERROR(ll, "cannot use %s, trying the factory calibration", path);
++	}
++	return ok;
++}
++
++static bool
++load_factory(struct quest1_calib *out, enum u_logging_level ll)
++{
++	cJSON *cams = read_json(CALIB_DIR "/camera_calibration_v2.json");
++	cJSON *imu = read_json(CALIB_DIR "/imu_calibration.json");
++	bool ok = cams != NULL && imu != NULL && parse_cameras(u_json_get(cams, "CameraCalibration"), out, ll) &&
++	          parse_imu(u_json_get(imu, "ImuCalibration"), &out->imu);
++	cJSON_Delete(cams);
++	cJSON_Delete(imu);
++	if (ok) {
++		snprintf(out->source, sizeof(out->source), "factory");
++	}
++	return ok;
++}
++
++bool
++quest1_calib_load(struct quest1_calib *out, enum u_logging_level ll)
++{
++	memset(out, 0, sizeof(*out));
++	if (!load_online(out, ll)) {
++		memset(out, 0, sizeof(*out));
++		if (!load_factory(out, ll)) {
++			CALIB_ERROR(ll, "no usable calibration in " CALIB_DIR);
++			return false;
++		}
++	}
++	CALIB_INFO(ll, "using %s", out->source);
++	for (int i = 0; i < QUEST1_CALIB_CAMS; i++) {
++		const struct quest1_cam_calib *c = &out->cam[i];
++		CALIB_INFO(ll, "camera %d: f %.2f c (%.2f, %.2f), KB4 [%.6f %.6f %.6f %.6f], fit rms %.3f px, max %.3f px", i,
++		           c->f, c->cx, c->cy, c->kb4[0], c->kb4[1], c->kb4[2], c->kb4[3], c->kb4_rms_px, c->kb4_max_px);
++	}
++	return true;
++}
++
++
++/*
++ *
++ * IMU.
++ *
++ */
++
++static void
++offset_at(const struct quest1_imu_offset *o, float t, float out[3])
++{
++	if (o->pair_count == 0) {
++		for (int i = 0; i < 3; i++) {
++			out[i] = o->offset_at_0c[i] + t * o->temp_coeff[i];
++		}
++		return;
++	}
++	// Linear interpolation, clamped at the ends (as numpy.interp).
++	const float(*p)[4] = o->pairs;
++	int n = o->pair_count;
++	if (t <= p[0][0] || n == 1) {
++		memcpy(out, &p[0][1], 3 * sizeof(float));
++		return;
++	}
++	if (t >= p[n - 1][0]) {
++		memcpy(out, &p[n - 1][1], 3 * sizeof(float));
++		return;
++	}
++	int k = 1;
++	while (p[k][0] < t) {
++		k++;
++	}
++	float span = p[k][0] - p[k - 1][0];
++	float a = span > 0 ? (t - p[k - 1][0]) / span : 0.0f;
++	for (int i = 0; i < 3; i++) {
++		out[i] = p[k - 1][1 + i] + a * (p[k][1 + i] - p[k - 1][1 + i]);
++	}
++}
++
++static struct xrt_vec3
++rectify(const float r[9], const struct quest1_imu_offset *o, float t, const float raw[3])
++{
++	float off[3], v[3];
++	offset_at(o, t, off);
++	for (int i = 0; i < 3; i++) {
++		v[i] = raw[i] - off[i];
++	}
++	return (struct xrt_vec3){
++	    r[0] * v[0] + r[1] * v[1] + r[2] * v[2],
++	    r[3] * v[0] + r[4] * v[1] + r[5] * v[2],
++	    r[6] * v[0] + r[7] * v[1] + r[8] * v[2],
++	};
++}
++
++void
++quest1_calib_rectify_imu(const struct quest1_imu_calib *c,
++                         float temperature,
++                         const float raw_accel[3],
++                         const float raw_gyro[3],
++                         struct xrt_vec3 *out_accel,
++                         struct xrt_vec3 *out_gyro)
++{
++	*out_accel = rectify(c->accel_rect, &c->accel_offset, temperature, raw_accel);
++	*out_gyro = rectify(c->gyro_rect, &c->gyro_offset, temperature, raw_gyro);
++}
+diff --git a/src/xrt/drivers/quest1/quest1_calib.h b/src/xrt/drivers/quest1/quest1_calib.h
+new file mode 100644
+index 0000000..055cdaa
+--- /dev/null
++++ b/src/xrt/drivers/quest1/quest1_calib.h
+@@ -0,0 +1,73 @@
++// Copyright 2026, Quest1-SteamOS contributors
++// SPDX-License-Identifier: BSL-1.0
++/*!
++ * @file
++ * @brief  Quest 1 camera and IMU calibration from /persist/calibration (Rift S JSON schema).
++ * @ingroup drv_quest1
++ */
++
++#pragma once
++
++#include "xrt/xrt_defines.h"
++#include "util/u_logging.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define QUEST1_CALIB_CAMS 4
++#define QUEST1_CALIB_MAX_PAIRS 64
++
++//! IMU offset in raw sensor coordinates as a function of the temperature.
++struct quest1_imu_offset
++{
++	int pair_count;                         //!< 0: constant (offset_at_0c + temp_coeff * T)
++	float offset_at_0c[3], temp_coeff[3];   //!< Constant and LinearTemperatureDependence
++	float pairs[QUEST1_CALIB_MAX_PAIRS][4]; //!< TemperaturePiecewiseLinear: T, x, y, z (sorted by T)
++};
++
++struct quest1_imu_calib
++{
++	//! Row-major 4x4. Device frame: +X right, +Y up, +Z back.
++	float device_from_imu[16];
++	float accel_rect[9], gyro_rect[9]; //!< row-major; rectified = R * (raw - offset(T))
++	struct quest1_imu_offset accel_offset, gyro_offset;
++};
++
++struct quest1_cam_calib
++{
++	//! Row-major 4x4; camera frame: OpenCV (+X right, +Y down, +Z forward in the image).
++	float device_from_camera[16];
++	int width, height;
++	double f, cx, cy;     //!< PinholeSymmetric
++	double fisheye62[8];  //!< k1..k6, p1, p2
++	double kb4[4];        //!< Kannala-Brandt fit with the same f, cx, cy
++	double kb4_rms_px, kb4_max_px;
++};
++
++struct quest1_calib
++{
++	char source[512]; //!< file the cameras and IMU came from
++	struct quest1_imu_calib imu;
++	struct quest1_cam_calib cam[QUEST1_CALIB_CAMS]; //!< index = calibration Id
++};
++
++/*!
++ * Loads the newest online calibration (/persist/calibration/online/<id>, refined by Meta's
++ * tracking), falling back to the factory files, and fits KB4 to each camera's Fisheye62.
++ */
++bool
++quest1_calib_load(struct quest1_calib *out, enum u_logging_level log_level);
++
++//! Raw IMU sample to device axes, with the temperature-dependent offsets removed.
++void
++quest1_calib_rectify_imu(const struct quest1_imu_calib *c,
++                         float temperature,
++                         const float raw_accel[3],
++                         const float raw_gyro[3],
++                         struct xrt_vec3 *out_accel,
++                         struct xrt_vec3 *out_gyro);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/src/xrt/drivers/quest1/quest1_cameras.c b/src/xrt/drivers/quest1/quest1_cameras.c
+new file mode 100644
+index 0000000..a4d38ab
+--- /dev/null
++++ b/src/xrt/drivers/quest1/quest1_cameras.c
+@@ -0,0 +1,665 @@
++// Copyright 2026, Quest1-SteamOS contributors
++// SPDX-License-Identifier: BSL-1.0
++/*!
++ * @file
++ * @brief  Quest 1 tracking cameras: the src/qcam capture sequence on the driver's SyncBoss handle,
++ *         HEADSET frames published to shared memory (quest1_cameras_shm.h) while readers ask for them,
++ *         and handed to an in-driver consumer (SLAM), which keeps the cameras running.
++ *
++ * libsyncboss powers and syncs the four OV7251 sensors, libqcameraoculushal (Qualcomm camera_v2
++ * mini-driver) streams them; both are bionic libraries loaded with libhybris. The IMU thread keeps
++ * pumping the SyncBoss stream, which the camera commands need. Prototypes and the call order are
++ * documented in src/qcam/qcam.c and docs/tracking-6dof.md.
++ *
++ * @ingroup drv_quest1
++ */
++
++#include "quest1_interface.h"
++#include "quest1_cameras_shm.h"
++
++#include "os/os_threading.h"
++#include "os/os_time.h"
++#include "util/u_debug.h"
++#include "util/u_file.h"
++#include "util/u_json.h"
++#include "util/u_logging.h"
++#include "util/u_misc.h"
++
++#include <dlfcn.h>
++#include <fcntl.h>
++#include <stdio.h>
++#include <string.h>
++#include <sys/mman.h>
++#include <unistd.h>
++
++extern void *
++android_dlopen(const char *filename, int flag);
++extern void *
++android_dlsym(void *handle, const char *symbol);
++
++DEBUG_GET_ONCE_NUM_OPTION(quest1_camera_exposure, "QUEST1_CAMERA_EXPOSURE_US", 0) // 0 = auto
++DEBUG_GET_ONCE_FLOAT_OPTION(quest1_camera_gain, "QUEST1_CAMERA_GAIN", 4.0f)
++// Auto-exposure limit; SLAM wants short exposures (less motion blur) and more gain instead.
++DEBUG_GET_ONCE_NUM_OPTION(quest1_camera_exposure_max, "QUEST1_CAMERA_EXPOSURE_MAX_US", 14000)
++
++#define CAM_ERROR(c, ...) U_LOG_IFL_E(c->log_level, "cameras: " __VA_ARGS__)
++#define CAM_INFO(c, ...) U_LOG_IFL_I(c->log_level, "cameras: " __VA_ARGS__)
++#define CAM_DEBUG(c, ...) U_LOG_IFL_D(c->log_level, "cameras: " __VA_ARGS__)
++
++#define CAM_PERIOD_US 33333  // 60 Hz mains; HEADSET and CONTROLLER frames alternate within it
++#define CAM_NBUFS 4
++#define CAM_DEQ_TIMEOUT_MS 100
++#define CAM_TAG_HEADSET 1
++#define CAM_EXP_MIN_US 100
++#define CAM_EXP_MAX_US 14000 // below the 16.7 ms frame slot
++#define CAM_SHUTTER_RING 32
++#define CAM_SHUTTER_MAX_AGE_NS (200 * U_TIME_1MS_IN_NS)
++#define CAM_GAIN_MAX_X16 128 // 8x
++#define CAM_TARGET_MEAN 90.0f
++#define CAM_DEMAND_TIMEOUT_NS (2 * (int64_t)U_TIME_1S_IN_NS) // after the last reader heartbeat
++#define CAM_IDLE_POLL_NS (100 * U_TIME_1MS_IN_NS)
++#define CAM_RETRY_NS (5 * (int64_t)U_TIME_1S_IN_NS)
++#define CAM_CALIB_PATH "/persist/calibration/camera_calibration_v2.json"
++
++
++/*
++ *
++ * libqcameraoculushal and the libsyncboss camera calls.
++ *
++ */
++
++//! qcamera_query_sensor_info output (0x8c bytes written), with slack.
++struct qc_sensor_info
++{
++	uint32_t width, height; // without the metadata line
++	uint32_t format;        // 0x70 = Y8
++	uint32_t bpp, pixel_proc, code_bits, px_per_code, packed, bayer, sensor_id;
++	uint8_t rest[140 - 40];
++	uint8_t slack[116];
++};
++
++struct qc_frame
++{
++	int64_t ts_sec, ts_nsec; // CLOCK_MONOTONIC
++	const void *fmt;
++	uint32_t sequence, pad0;
++	uint64_t zero[2];
++	uint8_t *data; // metadata line first
++	int32_t buffer_fd, pad1;
++	uint32_t poison;
++};
++
++struct sb_cam_egt
++{
++	uint16_t exposure; // us
++	uint16_t gain;     // gain * 16
++	uint8_t tag;
++	uint8_t pad;
++};
++
++struct sb_frame_meta
++{
++	uint16_t exposure;
++	uint8_t gain_x16;
++	uint8_t b3;
++	uint8_t tag; // 1 = HEADSET, 0 = CONTROLLER
++	uint8_t sync_id;
++	uint8_t pad[10];
++};
++
++struct cam_api
++{
++	void *(*open)(int bpp_mode);
++	int (*num_sensors)(void *hal);
++	void *(*get_sensor)(void *hal, int idx);
++	int (*query_info)(void *sensor, struct qc_sensor_info *out);
++	int (*start_sensor)(void *sensor, const uint32_t *dims, const void *fmt28, int nbufs, const int *fds, int meta);
++	struct qc_frame *(*dequeue)(void *sensor, int timeout_ms);
++	int (*enqueue)(void *sensor, struct qc_frame *f);
++	int (*stop_sensor)(void *sensor);
++	void (*release_sensor)(void *sensor);
++	void (*close)(void *hal);
++
++	int (*probe)(void *sb, uint8_t *mask);
++	int (*release)(void *sb);
++	int (*init)(void *sb, uint8_t n);
++	int (*deinit)(void *sb, uint8_t n);
++	int (*start_streaming)(void *sb, uint8_t n);
++	int (*stop_streaming)(void *sb, uint8_t n);
++	int (*set_bpp)(void *sb, uint8_t bpp);
++	int (*set_tag_mode)(void *sb, uint8_t mode);
++	int (*set_frame_rate)(void *sb, uint32_t period_us);
++	int (*params)(void *sb, void *out);
++	int (*set_exp_gain_tag)(void *sb, const struct sb_cam_egt *cfg4);
++	int (*decode_meta)(const void *line, struct sb_frame_meta *out, const void *params);
++};
++
++struct quest1_cameras
++{
++	enum u_logging_level log_level;
++	void *sb;
++	struct cam_api api;
++	struct os_thread_helper oth;
++
++	void *hal;
++	int n;
++	void *sensor[Q1CAM_N];
++	bool started[Q1CAM_N];
++	bool probed, inited, streaming;
++	uint8_t params[256];
++
++	struct q1cam_shm *shm;
++	quest1_frameset_fn consumer; //!< NULL = none; set before the thread starts
++	void *consumer_data;
++	int exposure_us, exposure_max_us;
++	uint16_t gain_x16, gain_min_x16;
++	bool auto_exposure;
++
++	//! SyncBoss shutter records from the IMU thread.
++	struct os_mutex shutter_mutex;
++	struct
++	{
++		uint64_t ts_us;    // IMU clock
++		int64_t recv_ns;   // monotonic arrival
++		uint8_t sync_id;
++	} shutter[CAM_SHUTTER_RING];
++	uint32_t shutter_head;
++};
++
++#define LOAD(lib, field, name)                                                                                         \
++	do {                                                                                                           \
++		*(void **)&c->api.field = android_dlsym(lib, name);                                                    \
++		if (c->api.field == NULL) {                                                                            \
++			CAM_ERROR(c, "missing symbol %s", name);                                                       \
++			return false;                                                                                  \
++		}                                                                                                      \
++	} while (false)
++
++static bool
++load_api(struct quest1_cameras *c)
++{
++	void *lsb = android_dlopen("libsyncboss.so", RTLD_NOW);
++	void *lqc = android_dlopen("libqcameraoculushal.so", RTLD_NOW);
++	if (lsb == NULL || lqc == NULL) {
++		CAM_ERROR(c, "cannot load libsyncboss.so / libqcameraoculushal.so");
++		return false;
++	}
++	LOAD(lqc, open, "qcamera_open");
++	LOAD(lqc, num_sensors, "qcamera_num_sensors");
++	LOAD(lqc, get_sensor, "qcamera_get_sensor");
++	LOAD(lqc, query_info, "qcamera_query_sensor_info");
++	LOAD(lqc, start_sensor, "qcamera_start_sensor");
++	LOAD(lqc, dequeue, "qcamera_dequeue");
++	LOAD(lqc, enqueue, "qcamera_enqueue");
++	LOAD(lqc, stop_sensor, "qcamera_stop_sensor");
++	LOAD(lqc, release_sensor, "qcamera_release_sensor");
++	LOAD(lqc, close, "qcamera_close");
++	LOAD(lsb, probe, "syncboss_camera_probe");
++	LOAD(lsb, release, "syncboss_camera_release");
++	LOAD(lsb, init, "syncboss_camera_init");
++	LOAD(lsb, deinit, "syncboss_camera_deinit");
++	LOAD(lsb, start_streaming, "syncboss_camera_start_streaming");
++	LOAD(lsb, stop_streaming, "syncboss_camera_stop_streaming");
++	LOAD(lsb, set_bpp, "syncboss_camera_set_bpp");
++	LOAD(lsb, set_tag_mode, "syncboss_camera_set_frame_tag_mode");
++	LOAD(lsb, set_frame_rate, "syncboss_camera_set_frame_rate");
++	LOAD(lsb, params, "syncboss_camera_params");
++	LOAD(lsb, set_exp_gain_tag, "syncboss_camera_set_exposure_gain_tag");
++	LOAD(lsb, decode_meta, "syncboss_camera_decode_metadata");
++	return true;
++}
++
++
++/*
++ *
++ * Calibration and shared memory.
++ *
++ */
++
++static void
++load_calibration(struct quest1_cameras *c)
++{
++	char *text = u_file_read_content_from_path(CAM_CALIB_PATH, NULL);
++	if (text == NULL) {
++		CAM_ERROR(c, "cannot read %s", CAM_CALIB_PATH);
++		return;
++	}
++	cJSON *root = cJSON_Parse(text);
++	free(text);
++	const cJSON *cams = u_json_get(root, "CameraCalibration");
++	const cJSON *cam;
++	cJSON_ArrayForEach(cam, cams)
++	{
++		char id[8] = {0};
++		u_json_get_string_into_array(u_json_get(cam, "Id"), id, sizeof(id));
++		int i = atoi(id);
++		if (i < 0 || i >= Q1CAM_N) {
++			continue;
++		}
++		struct q1cam_calib *k = &c->shm->calib[i];
++		float proj[3], dist[8];
++		if (u_json_get_float_array(u_json_get(cam, "DeviceFromCamera"), k->device_from_camera, 16) != 16 ||
++		    u_json_get_float_array(u_json_get(u_json_get(cam, "Projection"), "Coefficients"), proj, 3) != 3 ||
++		    u_json_get_float_array(u_json_get(u_json_get(cam, "Distortion"), "Coefficients"), dist, 8) != 8) {
++			CAM_ERROR(c, "camera %d: unexpected calibration layout", i);
++			continue;
++		}
++		k->f = proj[0];
++		k->cx = proj[1];
++		k->cy = proj[2];
++		memcpy(k->k, dist, sizeof(k->k));
++		memcpy(k->p, dist + 6, sizeof(k->p));
++		c->shm->calib_valid |= 1u << i;
++	}
++	cJSON_Delete(root);
++}
++
++static bool
++create_shm(struct quest1_cameras *c)
++{
++	int fd = shm_open(Q1CAM_SHM_NAME, O_CREAT | O_RDWR | O_TRUNC, 0600);
++	if (fd < 0 || ftruncate(fd, sizeof(struct q1cam_shm)) != 0) {
++		CAM_ERROR(c, "cannot create shared memory %s", Q1CAM_SHM_NAME);
++		if (fd >= 0) {
++			close(fd);
++		}
++		return false;
++	}
++	c->shm = mmap(NULL, sizeof(struct q1cam_shm), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
++	close(fd);
++	if (c->shm == MAP_FAILED) {
++		c->shm = NULL;
++		return false;
++	}
++	c->shm->ncams = Q1CAM_N;
++	c->shm->width = Q1CAM_W;
++	c->shm->height = Q1CAM_H;
++	c->shm->slots = Q1CAM_SLOTS;
++	c->shm->version = Q1CAM_VERSION;
++	load_calibration(c);
++	__atomic_store_n(&c->shm->magic, Q1CAM_MAGIC, __ATOMIC_RELEASE);
++	return true;
++}
++
++
++/*
++ *
++ * Capture.
++ *
++ */
++
++static void
++set_exposure(struct quest1_cameras *c)
++{
++	struct sb_cam_egt cfg[4];
++	memset(cfg, 0, sizeof(cfg));
++	for (int i = 0; i < 4; i++) {
++		cfg[i].exposure = (uint16_t)c->exposure_us;
++		cfg[i].gain = c->gain_x16;
++		cfg[i].tag = CAM_TAG_HEADSET;
++	}
++	c->api.set_exp_gain_tag(c->sb, cfg);
++}
++
++//! The qcam sequence (MontereyCameraProvider order), up to streaming.
++static bool
++start_cameras(struct quest1_cameras *c)
++{
++	struct cam_api *a = &c->api;
++	c->hal = a->open(0); // 8 bpp
++	if (c->hal == NULL) {
++		CAM_ERROR(c, "qcamera_open failed");
++		return false;
++	}
++	c->n = a->num_sensors(c->hal) & 0xff;
++	uint8_t mask = 0;
++	int r = a->probe(c->sb, &mask);
++	if (r != 0) {
++		CAM_ERROR(c, "syncboss_camera_probe: %d", r);
++		return false;
++	}
++	c->probed = true;
++	if (c->n != Q1CAM_N || __builtin_popcount(mask) != Q1CAM_N) {
++		CAM_ERROR(c, "expected 4 cameras: HAL %d, SyncBoss mask 0x%02x", c->n, mask);
++		return false;
++	}
++	a->set_bpp(c->sb, 8);
++	r = a->init(c->sb, Q1CAM_N);
++	if (r != 0) {
++		CAM_ERROR(c, "syncboss_camera_init: %d", r);
++		return false;
++	}
++	c->inited = true;
++
++	struct qc_sensor_info info[Q1CAM_N];
++	memset(info, 0, sizeof(info));
++	for (int i = 0; i < Q1CAM_N; i++) {
++		c->sensor[i] = a->get_sensor(c->hal, i);
++		if (c->sensor[i] == NULL) {
++			CAM_ERROR(c, "qcamera_get_sensor(%d) failed", i);
++			return false;
++		}
++		a->query_info(c->sensor[i], &info[i]);
++		if (info[i].width != Q1CAM_W || info[i].height != Q1CAM_H || info[i].bpp != 8) {
++			CAM_ERROR(c, "camera %d: unexpected %ux%u, %u bpp", i, info[i].width, info[i].height, info[i].bpp);
++			return false;
++		}
++	}
++	a->set_frame_rate(c->sb, CAM_PERIOD_US);
++	if (a->params(c->sb, c->params) != 0) {
++		CAM_ERROR(c, "syncboss_camera_params failed");
++		return false;
++	}
++	for (int i = 0; i < Q1CAM_N; i++) {
++		r = a->start_sensor(c->sensor[i], &info[i].width, &info[i].format, CAM_NBUFS, NULL, 1);
++		if (r != 0) {
++			CAM_ERROR(c, "qcamera_start_sensor(%d): %d", i, r);
++			return false;
++		}
++		c->started[i] = true;
++	}
++	a->set_tag_mode(c->sb, 1);
++	r = a->start_streaming(c->sb, Q1CAM_N);
++	c->streaming = true; // stop it even if the call reported an error
++	if (r != 0) {
++		CAM_ERROR(c, "syncboss_camera_start_streaming: %d", r);
++		return false;
++	}
++	set_exposure(c);
++	return true;
++}
++
++static void
++stop_cameras(struct quest1_cameras *c)
++{
++	struct cam_api *a = &c->api;
++	if (c->streaming) {
++		a->stop_streaming(c->sb, Q1CAM_N);
++		c->streaming = false;
++	}
++	for (int i = 0; i < Q1CAM_N; i++) {
++		if (c->started[i]) {
++			a->stop_sensor(c->sensor[i]);
++			c->started[i] = false;
++		}
++	}
++	for (int i = 0; i < Q1CAM_N; i++) {
++		if (c->sensor[i] != NULL) {
++			a->release_sensor(c->sensor[i]);
++			c->sensor[i] = NULL;
++		}
++	}
++	if (c->hal != NULL) {
++		a->close(c->hal);
++		c->hal = NULL;
++	}
++	if (c->inited) {
++		a->deinit(c->sb, Q1CAM_N);
++		c->inited = false;
++	}
++	if (c->probed) {
++		a->release(c->sb);
++		c->probed = false;
++	}
++}
++
++//! Simple auto exposure on the mean of a pixel grid over all cameras.
++static void
++update_exposure(struct quest1_cameras *c, const struct q1cam_slot *s)
++{
++	uint64_t sum = 0, count = 0;
++	for (int i = 0; i < Q1CAM_N; i++) {
++		for (int y = 8; y < Q1CAM_H; y += 16) {
++			for (int x = 8; x < Q1CAM_W; x += 16) {
++				sum += s->pixels[i][y * Q1CAM_W + x];
++				count++;
++			}
++		}
++	}
++	float mean = (float)sum / (float)count;
++	float ratio = CAM_TARGET_MEAN / (mean < 1.0f ? 1.0f : mean);
++	ratio = ratio < 0.7f ? 0.7f : (ratio > 1.4f ? 1.4f : ratio);
++	// Exposure first; gain (from QUEST1_CAMERA_GAIN up to CAM_GAIN_MAX_X16) only at the exposure limit.
++	int exp = c->exposure_us, gain = c->gain_x16;
++	if (ratio > 1.0f && exp >= c->exposure_max_us) {
++		gain = (int)((float)gain * ratio);
++	} else if (ratio < 1.0f && gain > c->gain_min_x16) {
++		gain = (int)((float)gain * ratio);
++		gain = gain < c->gain_min_x16 ? c->gain_min_x16 : gain;
++	} else {
++		exp = (int)((float)exp * ratio);
++	}
++	exp = exp < CAM_EXP_MIN_US ? CAM_EXP_MIN_US : (exp > c->exposure_max_us ? c->exposure_max_us : exp);
++	gain = gain > CAM_GAIN_MAX_X16 ? CAM_GAIN_MAX_X16 : gain;
++	if (abs(exp - c->exposure_us) * 20 > c->exposure_us || abs(gain - c->gain_x16) * 20 > c->gain_x16) {
++		CAM_DEBUG(c, "mean %.1f, exposure %d -> %d us, gain %d -> %d /16", mean, c->exposure_us, exp,
++		          c->gain_x16, gain);
++		c->exposure_us = exp;
++		c->gain_x16 = (uint16_t)gain;
++		set_exposure(c);
++	}
++}
++
++//! The newest recent shutter record with this frame-sync id (4 bits), 0 if none.
++static int64_t
++find_shutter_ns(struct quest1_cameras *c, uint8_t sync_id)
++{
++	int64_t now = os_monotonic_get_ns(), ts = 0;
++	os_mutex_lock(&c->shutter_mutex);
++	for (uint32_t i = 1; i <= CAM_SHUTTER_RING && i <= c->shutter_head; i++) {
++		uint32_t k = (c->shutter_head - i) % CAM_SHUTTER_RING;
++		if (now - c->shutter[k].recv_ns > CAM_SHUTTER_MAX_AGE_NS) {
++			break;
++		}
++		if ((c->shutter[k].sync_id & 0xf) == (sync_id & 0xf)) {
++			ts = (int64_t)(c->shutter[k].ts_us * U_TIME_1US_IN_NS);
++			break;
++		}
++	}
++	os_mutex_unlock(&c->shutter_mutex);
++	return ts;
++}
++
++//! Dequeues one frameset; HEADSET framesets are published. False on a dequeue timeout.
++static bool
++capture_frameset(struct quest1_cameras *c, uint64_t *seq)
++{
++	struct q1cam_slot *s = &c->shm->slot[(*seq + 1) % Q1CAM_SLOTS];
++	// Readers still copying this slot must see that it changes under them.
++	__atomic_store_n(&s->seq, 0, __ATOMIC_RELAXED);
++	__atomic_thread_fence(__ATOMIC_RELEASE);
++	struct qc_frame *f[Q1CAM_N];
++	bool ok = true, headset = false;
++	for (int i = 0; i < Q1CAM_N; i++) {
++		f[i] = c->api.dequeue(c->sensor[i], CAM_DEQ_TIMEOUT_MS);
++		if (f[i] == NULL || f[i]->data == NULL) {
++			ok = false;
++			continue;
++		}
++		struct sb_frame_meta m;
++		memset(&m, 0, sizeof(m));
++		c->api.decode_meta(f[i]->data, &m, c->params);
++		if (i == 0) {
++			headset = m.tag == CAM_TAG_HEADSET;
++			s->timestamp_ns = f[i]->ts_sec * U_TIME_1S_IN_NS + f[i]->ts_nsec;
++			s->sync_id = m.sync_id;
++			s->shutter_ns = headset ? find_shutter_ns(c, m.sync_id) : 0;
++		}
++		if (headset) {
++			memcpy(s->pixels[i], f[i]->data + Q1CAM_W, Q1CAM_W * Q1CAM_H); // skip the metadata line
++			s->exposure_us[i] = m.exposure;
++			s->gain_x16[i] = m.gain_x16;
++		}
++	}
++	for (int i = 0; i < Q1CAM_N; i++) {
++		if (f[i] != NULL) {
++			c->api.enqueue(c->sensor[i], f[i]);
++		}
++	}
++	if (ok && headset) {
++		(*seq)++;
++		__atomic_store_n(&s->seq, *seq, __ATOMIC_RELEASE);
++		__atomic_store_n(&c->shm->latest, *seq, __ATOMIC_RELEASE);
++		if (c->consumer != NULL && s->shutter_ns != 0) {
++			const uint8_t *pixels[Q1CAM_N];
++			for (int i = 0; i < Q1CAM_N; i++) {
++				pixels[i] = s->pixels[i];
++			}
++			c->consumer(c->consumer_data, s->shutter_ns, pixels);
++		}
++		if (c->auto_exposure && *seq % 8 == 0) {
++			update_exposure(c, s);
++		}
++	}
++	return ok;
++}
++
++static bool
++demanded(struct quest1_cameras *c)
++{
++	if (c->consumer != NULL) {
++		return true;
++	}
++	int64_t demand = (int64_t)__atomic_load_n(&c->shm->demand_ns, __ATOMIC_ACQUIRE);
++	return demand != 0 && os_monotonic_get_ns() - demand < CAM_DEMAND_TIMEOUT_NS;
++}
++
++//! Idle until a reader asks for frames, stream while asked, power the cameras down afterwards.
++static void *
++camera_thread(void *ptr)
++{
++	struct quest1_cameras *c = ptr;
++	os_thread_helper_name(&c->oth, "Quest1 cameras");
++
++	uint64_t seq = 0;
++	int64_t retry_after_ns = 0;
++	os_thread_helper_lock(&c->oth);
++	while (os_thread_helper_is_running_locked(&c->oth)) {
++		os_thread_helper_unlock(&c->oth);
++
++		if (!demanded(c) || os_monotonic_get_ns() < retry_after_ns) {
++			os_nanosleep(CAM_IDLE_POLL_NS);
++		} else if (!start_cameras(c)) {
++			stop_cameras(c);
++			retry_after_ns = os_monotonic_get_ns() + CAM_RETRY_NS;
++		} else {
++			CAM_INFO(c, "streaming (exposure %s %d us, gain %.1f)", c->auto_exposure ? "auto" : "fixed",
++			         c->exposure_us, c->gain_x16 / 16.0f);
++			__atomic_store_n(&c->shm->streaming, 1, __ATOMIC_RELEASE);
++			uint64_t first = seq, timeouts = 0;
++			while (demanded(c) && os_thread_helper_is_running(&c->oth)) {
++				if (!capture_frameset(c, &seq) && ++timeouts % 50 == 0) {
++					CAM_ERROR(c, "%llu dequeue timeouts", (unsigned long long)timeouts);
++				}
++			}
++			__atomic_store_n(&c->shm->streaming, 0, __ATOMIC_RELEASE);
++			stop_cameras(c);
++			CAM_INFO(c, "stopped after %llu framesets", (unsigned long long)(seq - first));
++		}
++
++		os_thread_helper_lock(&c->oth);
++	}
++	os_thread_helper_unlock(&c->oth);
++	return NULL;
++}
++
++
++/*
++ *
++ * Exported functions.
++ *
++ */
++
++struct quest1_cameras *
++quest1_cameras_start(void *sb_handle, enum u_logging_level log_level, quest1_frameset_fn consumer, void *consumer_data)
++{
++	struct quest1_cameras *c = U_TYPED_CALLOC(struct quest1_cameras);
++	c->log_level = log_level;
++	c->sb = sb_handle;
++	c->consumer = consumer;
++	c->consumer_data = consumer_data;
++	int64_t exp = debug_get_num_option_quest1_camera_exposure();
++	c->auto_exposure = exp <= 0;
++	c->exposure_us = c->auto_exposure ? 8000 : (int)exp;
++	c->gain_x16 = (uint16_t)(debug_get_float_option_quest1_camera_gain() * 16.0f + 0.5f);
++	c->gain_min_x16 = c->gain_x16;
++	c->exposure_max_us = (int)debug_get_num_option_quest1_camera_exposure_max();
++	c->exposure_max_us = c->exposure_max_us < CAM_EXP_MIN_US   ? CAM_EXP_MIN_US
++	                     : c->exposure_max_us > CAM_EXP_MAX_US ? CAM_EXP_MAX_US
++	                                                           : c->exposure_max_us;
++	if (c->auto_exposure && c->exposure_us > c->exposure_max_us) {
++		c->exposure_us = c->exposure_max_us;
++	}
++	os_mutex_init(&c->shutter_mutex);
++	os_thread_helper_init(&c->oth);
++
++	if (!load_api(c) || !create_shm(c) || os_thread_helper_start(&c->oth, camera_thread, c) != 0) {
++		quest1_cameras_destroy(&c);
++		return NULL;
++	}
++	return c;
++}
++
++void
++quest1_cameras_stop(struct quest1_cameras *c)
++{
++	if (c != NULL) {
++		os_thread_helper_stop_and_wait(&c->oth); // the thread stops the cameras
++	}
++}
++
++void
++quest1_cameras_destroy(struct quest1_cameras **c_ptr)
++{
++	struct quest1_cameras *c = *c_ptr;
++	if (c == NULL) {
++		return;
++	}
++	os_thread_helper_destroy(&c->oth); // stops the thread (and so the cameras) if still running
++	os_mutex_destroy(&c->shutter_mutex);
++	if (c->shm != NULL) {
++		munmap(c->shm, sizeof(struct q1cam_shm));
++		shm_unlink(Q1CAM_SHM_NAME);
++	}
++	free(c);
++	*c_ptr = NULL;
++}
++
++void
++quest1_cameras_push_imu(struct quest1_cameras *c,
++                        uint64_t timestamp_us,
++                        const float accel[3],
++                        const float gyro[3],
++                        float temperature,
++                        int64_t imu_to_monotonic_ns)
++{
++	if (c == NULL) {
++		return;
++	}
++	struct q1cam_shm *shm = c->shm;
++	uint64_t n = shm->imu_latest + 1; // only this thread writes
++	struct q1cam_imu_sample *e = &shm->imu[n % Q1CAM_IMU_RING];
++	__atomic_store_n(&e->seq, 0, __ATOMIC_RELAXED);
++	__atomic_thread_fence(__ATOMIC_RELEASE);
++	e->timestamp_ns = (int64_t)(timestamp_us * U_TIME_1US_IN_NS);
++	memcpy(e->accel, accel, sizeof(e->accel));
++	memcpy(e->gyro, gyro, sizeof(e->gyro));
++	e->temperature = temperature;
++	__atomic_store_n(&e->seq, n, __ATOMIC_RELEASE);
++	__atomic_store_n(&shm->imu_to_monotonic_ns, imu_to_monotonic_ns, __ATOMIC_RELAXED);
++	__atomic_store_n(&shm->imu_latest, n, __ATOMIC_RELEASE);
++}
++
++void
++quest1_cameras_push_shutter(struct quest1_cameras *c, uint64_t timestamp_us, uint8_t sync_id)
++{
++	if (c == NULL) {
++		return;
++	}
++	os_mutex_lock(&c->shutter_mutex);
++	uint32_t k = c->shutter_head++ % CAM_SHUTTER_RING;
++	c->shutter[k].ts_us = timestamp_us;
++	c->shutter[k].recv_ns = os_monotonic_get_ns();
++	c->shutter[k].sync_id = sync_id;
++	os_mutex_unlock(&c->shutter_mutex);
++}
+diff --git a/src/xrt/drivers/quest1/quest1_cameras_shm.h b/src/xrt/drivers/quest1/quest1_cameras_shm.h
+new file mode 100644
+index 0000000..875f6a0
+--- /dev/null
++++ b/src/xrt/drivers/quest1/quest1_cameras_shm.h
+@@ -0,0 +1,84 @@
++// Copyright 2026, Quest1-SteamOS contributors
++// SPDX-License-Identifier: BSL-1.0
++/*!
++ * @file
++ * @brief  Shared-memory layout of the tracking camera frames that the quest1 driver publishes
++ *         (QUEST1_CAMERAS=0 turns it off). Plain C, no Monado headers: clients include it directly.
++ *
++ * The writer clears slot (n % Q1CAM_SLOTS)'s seq, fills the slot, sets its seq to n, then stores
++ * latest = n (release). A reader loads latest (acquire), copies that slot and checks that its seq
++ * is still n. The IMU ring works the same way, one sample per entry: imu[n % Q1CAM_IMU_RING].
++ *
++ * Two clocks: CLOCK_MONOTONIC (the ISP frame timestamps) and the SyncBoss MCU clock (IMU samples
++ * and camera shutter times, in ns here). imu_to_monotonic_ns is the driver's current mapping,
++ * monotonic = IMU clock + imu_to_monotonic_ns (smallest delivery delay, follows drift slowly).
++ *
++ * The cameras run only on demand: a reader stores CLOCK_MONOTONIC ns into demand_ns at least every
++ * 0.5 s (the region is root-only, open it O_RDWR). The driver powers the cameras up when demand_ns
++ * is fresh (startup takes about a second) and down 2 s after the last heartbeat.
++ *
++ * @ingroup drv_quest1
++ */
++
++#pragma once
++
++#include <stdint.h>
++
++#define Q1CAM_SHM_NAME "/quest1-cameras"
++#define Q1CAM_MAGIC 0x314d4351u // "QCM1"
++#define Q1CAM_VERSION 3
++#define Q1CAM_N 4
++#define Q1CAM_W 640
++#define Q1CAM_H 480
++#define Q1CAM_SLOTS 3
++#define Q1CAM_IMU_RING 4096 // about 4 s at 1 kHz
++
++//! Factory calibration from /persist/calibration/camera_calibration_v2.json.
++struct q1cam_calib
++{
++	//! Row-major 4x4. Device frame: +X right, +Y up, +Z back; camera frame: OpenCV (+Z forward).
++	float device_from_camera[16];
++	float f, cx, cy; //!< PinholeSymmetric, pixels
++	float k[6];      //!< Fisheye62 radial: theta_d = theta * (1 + k0 theta^2 + ... + k5 theta^12)
++	float p[2];      //!< Fisheye62 tangential
++	float pad;
++};
++
++struct q1cam_slot
++{
++	uint64_t seq;
++	int64_t timestamp_ns; //!< CLOCK_MONOTONIC ISP timestamp of camera 0 (frame end, not exposure)
++	int64_t shutter_ns;   //!< SyncBoss shutter time, IMU clock; 0 if no shutter record matched
++	uint16_t exposure_us[Q1CAM_N];
++	uint8_t gain_x16[Q1CAM_N];
++	uint8_t sync_id; //!< frame-sync id from the metadata line (4 bits)
++	uint8_t pad[3];
++	uint8_t pixels[Q1CAM_N][Q1CAM_W * Q1CAM_H]; //!< Y8, index = calibration Id
++};
++
++//! Headset IMU sample as SyncBoss delivers it (1 kHz, IMU sensor axes, no calibration applied).
++struct q1cam_imu_sample
++{
++	uint64_t seq;
++	int64_t timestamp_ns; //!< IMU clock
++	float accel[3];       //!< m/s^2
++	float gyro[3];        //!< rad/s
++	float temperature;    //!< deg C
++	uint32_t pad;
++};
++
++struct q1cam_shm
++{
++	uint32_t magic, version;
++	uint32_t ncams, width, height, slots;
++	uint32_t calib_valid; //!< bit i: calib[i] was loaded
++	uint32_t streaming;   //!< 1 while the cameras run
++	struct q1cam_calib calib[Q1CAM_N];
++	uint64_t latest;    //!< 0 = no frame yet
++	uint64_t demand_ns; //!< written by readers: CLOCK_MONOTONIC of their last heartbeat
++	uint64_t imu_latest;         //!< 0 = no IMU sample yet
++	int64_t imu_to_monotonic_ns; //!< see above
++	uint64_t pad2[4];
++	struct q1cam_slot slot[Q1CAM_SLOTS];
++	struct q1cam_imu_sample imu[Q1CAM_IMU_RING];
++};
 diff --git a/src/xrt/drivers/quest1/quest1_controller.c b/src/xrt/drivers/quest1/quest1_controller.c
 new file mode 100644
 index 0000000..050e867
@@ -5170,772 +6498,34 @@ index 0000000..050e867
 +{
 +	return &c->base;
 +}
-diff --git a/src/xrt/drivers/quest1/quest1_cameras.c b/src/xrt/drivers/quest1/quest1_cameras.c
-new file mode 100644
-index 0000000..fdd60fb
---- /dev/null
-+++ b/src/xrt/drivers/quest1/quest1_cameras.c
-@@ -0,0 +1,650 @@
-+// Copyright 2026, Quest1-SteamOS contributors
-+// SPDX-License-Identifier: BSL-1.0
-+/*!
-+ * @file
-+ * @brief  Quest 1 tracking cameras: the src/qcam capture sequence on the driver's SyncBoss handle,
-+ *         HEADSET frames published to shared memory (quest1_cameras_shm.h) while readers ask for them.
-+ *
-+ * libsyncboss powers and syncs the four OV7251 sensors, libqcameraoculushal (Qualcomm camera_v2
-+ * mini-driver) streams them; both are bionic libraries loaded with libhybris. The IMU thread keeps
-+ * pumping the SyncBoss stream, which the camera commands need. Prototypes and the call order are
-+ * documented in src/qcam/qcam.c and docs/tracking-6dof.md.
-+ *
-+ * @ingroup drv_quest1
-+ */
-+
-+#include "quest1_interface.h"
-+#include "quest1_cameras_shm.h"
-+
-+#include "os/os_threading.h"
-+#include "os/os_time.h"
-+#include "util/u_debug.h"
-+#include "util/u_file.h"
-+#include "util/u_json.h"
-+#include "util/u_logging.h"
-+#include "util/u_misc.h"
-+
-+#include <dlfcn.h>
-+#include <fcntl.h>
-+#include <stdio.h>
-+#include <string.h>
-+#include <sys/mman.h>
-+#include <unistd.h>
-+
-+extern void *
-+android_dlopen(const char *filename, int flag);
-+extern void *
-+android_dlsym(void *handle, const char *symbol);
-+
-+DEBUG_GET_ONCE_NUM_OPTION(quest1_camera_exposure, "QUEST1_CAMERA_EXPOSURE_US", 0) // 0 = auto
-+DEBUG_GET_ONCE_FLOAT_OPTION(quest1_camera_gain, "QUEST1_CAMERA_GAIN", 4.0f)
-+// Auto-exposure limit; SLAM wants short exposures (less motion blur) and more gain instead.
-+DEBUG_GET_ONCE_NUM_OPTION(quest1_camera_exposure_max, "QUEST1_CAMERA_EXPOSURE_MAX_US", 14000)
-+
-+#define CAM_ERROR(c, ...) U_LOG_IFL_E(c->log_level, "cameras: " __VA_ARGS__)
-+#define CAM_INFO(c, ...) U_LOG_IFL_I(c->log_level, "cameras: " __VA_ARGS__)
-+#define CAM_DEBUG(c, ...) U_LOG_IFL_D(c->log_level, "cameras: " __VA_ARGS__)
-+
-+#define CAM_PERIOD_US 33333  // 60 Hz mains; HEADSET and CONTROLLER frames alternate within it
-+#define CAM_NBUFS 4
-+#define CAM_DEQ_TIMEOUT_MS 100
-+#define CAM_TAG_HEADSET 1
-+#define CAM_EXP_MIN_US 100
-+#define CAM_EXP_MAX_US 14000 // below the 16.7 ms frame slot
-+#define CAM_SHUTTER_RING 32
-+#define CAM_SHUTTER_MAX_AGE_NS (200 * U_TIME_1MS_IN_NS)
-+#define CAM_GAIN_MAX_X16 128 // 8x
-+#define CAM_TARGET_MEAN 90.0f
-+#define CAM_DEMAND_TIMEOUT_NS (2 * (int64_t)U_TIME_1S_IN_NS) // after the last reader heartbeat
-+#define CAM_IDLE_POLL_NS (100 * U_TIME_1MS_IN_NS)
-+#define CAM_RETRY_NS (5 * (int64_t)U_TIME_1S_IN_NS)
-+#define CAM_CALIB_PATH "/persist/calibration/camera_calibration_v2.json"
-+
-+
-+/*
-+ *
-+ * libqcameraoculushal and the libsyncboss camera calls.
-+ *
-+ */
-+
-+//! qcamera_query_sensor_info output (0x8c bytes written), with slack.
-+struct qc_sensor_info
-+{
-+	uint32_t width, height; // without the metadata line
-+	uint32_t format;        // 0x70 = Y8
-+	uint32_t bpp, pixel_proc, code_bits, px_per_code, packed, bayer, sensor_id;
-+	uint8_t rest[140 - 40];
-+	uint8_t slack[116];
-+};
-+
-+struct qc_frame
-+{
-+	int64_t ts_sec, ts_nsec; // CLOCK_MONOTONIC
-+	const void *fmt;
-+	uint32_t sequence, pad0;
-+	uint64_t zero[2];
-+	uint8_t *data; // metadata line first
-+	int32_t buffer_fd, pad1;
-+	uint32_t poison;
-+};
-+
-+struct sb_cam_egt
-+{
-+	uint16_t exposure; // us
-+	uint16_t gain;     // gain * 16
-+	uint8_t tag;
-+	uint8_t pad;
-+};
-+
-+struct sb_frame_meta
-+{
-+	uint16_t exposure;
-+	uint8_t gain_x16;
-+	uint8_t b3;
-+	uint8_t tag; // 1 = HEADSET, 0 = CONTROLLER
-+	uint8_t sync_id;
-+	uint8_t pad[10];
-+};
-+
-+struct cam_api
-+{
-+	void *(*open)(int bpp_mode);
-+	int (*num_sensors)(void *hal);
-+	void *(*get_sensor)(void *hal, int idx);
-+	int (*query_info)(void *sensor, struct qc_sensor_info *out);
-+	int (*start_sensor)(void *sensor, const uint32_t *dims, const void *fmt28, int nbufs, const int *fds, int meta);
-+	struct qc_frame *(*dequeue)(void *sensor, int timeout_ms);
-+	int (*enqueue)(void *sensor, struct qc_frame *f);
-+	int (*stop_sensor)(void *sensor);
-+	void (*release_sensor)(void *sensor);
-+	void (*close)(void *hal);
-+
-+	int (*probe)(void *sb, uint8_t *mask);
-+	int (*release)(void *sb);
-+	int (*init)(void *sb, uint8_t n);
-+	int (*deinit)(void *sb, uint8_t n);
-+	int (*start_streaming)(void *sb, uint8_t n);
-+	int (*stop_streaming)(void *sb, uint8_t n);
-+	int (*set_bpp)(void *sb, uint8_t bpp);
-+	int (*set_tag_mode)(void *sb, uint8_t mode);
-+	int (*set_frame_rate)(void *sb, uint32_t period_us);
-+	int (*params)(void *sb, void *out);
-+	int (*set_exp_gain_tag)(void *sb, const struct sb_cam_egt *cfg4);
-+	int (*decode_meta)(const void *line, struct sb_frame_meta *out, const void *params);
-+};
-+
-+struct quest1_cameras
-+{
-+	enum u_logging_level log_level;
-+	void *sb;
-+	struct cam_api api;
-+	struct os_thread_helper oth;
-+
-+	void *hal;
-+	int n;
-+	void *sensor[Q1CAM_N];
-+	bool started[Q1CAM_N];
-+	bool probed, inited, streaming;
-+	uint8_t params[256];
-+
-+	struct q1cam_shm *shm;
-+	int exposure_us, exposure_max_us;
-+	uint16_t gain_x16, gain_min_x16;
-+	bool auto_exposure;
-+
-+	//! SyncBoss shutter records from the IMU thread.
-+	struct os_mutex shutter_mutex;
-+	struct
-+	{
-+		uint64_t ts_us;    // IMU clock
-+		int64_t recv_ns;   // monotonic arrival
-+		uint8_t sync_id;
-+	} shutter[CAM_SHUTTER_RING];
-+	uint32_t shutter_head;
-+};
-+
-+#define LOAD(lib, field, name)                                                                                         \
-+	do {                                                                                                           \
-+		*(void **)&c->api.field = android_dlsym(lib, name);                                                    \
-+		if (c->api.field == NULL) {                                                                            \
-+			CAM_ERROR(c, "missing symbol %s", name);                                                       \
-+			return false;                                                                                  \
-+		}                                                                                                      \
-+	} while (false)
-+
-+static bool
-+load_api(struct quest1_cameras *c)
-+{
-+	void *lsb = android_dlopen("libsyncboss.so", RTLD_NOW);
-+	void *lqc = android_dlopen("libqcameraoculushal.so", RTLD_NOW);
-+	if (lsb == NULL || lqc == NULL) {
-+		CAM_ERROR(c, "cannot load libsyncboss.so / libqcameraoculushal.so");
-+		return false;
-+	}
-+	LOAD(lqc, open, "qcamera_open");
-+	LOAD(lqc, num_sensors, "qcamera_num_sensors");
-+	LOAD(lqc, get_sensor, "qcamera_get_sensor");
-+	LOAD(lqc, query_info, "qcamera_query_sensor_info");
-+	LOAD(lqc, start_sensor, "qcamera_start_sensor");
-+	LOAD(lqc, dequeue, "qcamera_dequeue");
-+	LOAD(lqc, enqueue, "qcamera_enqueue");
-+	LOAD(lqc, stop_sensor, "qcamera_stop_sensor");
-+	LOAD(lqc, release_sensor, "qcamera_release_sensor");
-+	LOAD(lqc, close, "qcamera_close");
-+	LOAD(lsb, probe, "syncboss_camera_probe");
-+	LOAD(lsb, release, "syncboss_camera_release");
-+	LOAD(lsb, init, "syncboss_camera_init");
-+	LOAD(lsb, deinit, "syncboss_camera_deinit");
-+	LOAD(lsb, start_streaming, "syncboss_camera_start_streaming");
-+	LOAD(lsb, stop_streaming, "syncboss_camera_stop_streaming");
-+	LOAD(lsb, set_bpp, "syncboss_camera_set_bpp");
-+	LOAD(lsb, set_tag_mode, "syncboss_camera_set_frame_tag_mode");
-+	LOAD(lsb, set_frame_rate, "syncboss_camera_set_frame_rate");
-+	LOAD(lsb, params, "syncboss_camera_params");
-+	LOAD(lsb, set_exp_gain_tag, "syncboss_camera_set_exposure_gain_tag");
-+	LOAD(lsb, decode_meta, "syncboss_camera_decode_metadata");
-+	return true;
-+}
-+
-+
-+/*
-+ *
-+ * Calibration and shared memory.
-+ *
-+ */
-+
-+static void
-+load_calibration(struct quest1_cameras *c)
-+{
-+	char *text = u_file_read_content_from_path(CAM_CALIB_PATH, NULL);
-+	if (text == NULL) {
-+		CAM_ERROR(c, "cannot read %s", CAM_CALIB_PATH);
-+		return;
-+	}
-+	cJSON *root = cJSON_Parse(text);
-+	free(text);
-+	const cJSON *cams = u_json_get(root, "CameraCalibration");
-+	const cJSON *cam;
-+	cJSON_ArrayForEach(cam, cams)
-+	{
-+		char id[8] = {0};
-+		u_json_get_string_into_array(u_json_get(cam, "Id"), id, sizeof(id));
-+		int i = atoi(id);
-+		if (i < 0 || i >= Q1CAM_N) {
-+			continue;
-+		}
-+		struct q1cam_calib *k = &c->shm->calib[i];
-+		float proj[3], dist[8];
-+		if (u_json_get_float_array(u_json_get(cam, "DeviceFromCamera"), k->device_from_camera, 16) != 16 ||
-+		    u_json_get_float_array(u_json_get(u_json_get(cam, "Projection"), "Coefficients"), proj, 3) != 3 ||
-+		    u_json_get_float_array(u_json_get(u_json_get(cam, "Distortion"), "Coefficients"), dist, 8) != 8) {
-+			CAM_ERROR(c, "camera %d: unexpected calibration layout", i);
-+			continue;
-+		}
-+		k->f = proj[0];
-+		k->cx = proj[1];
-+		k->cy = proj[2];
-+		memcpy(k->k, dist, sizeof(k->k));
-+		memcpy(k->p, dist + 6, sizeof(k->p));
-+		c->shm->calib_valid |= 1u << i;
-+	}
-+	cJSON_Delete(root);
-+}
-+
-+static bool
-+create_shm(struct quest1_cameras *c)
-+{
-+	int fd = shm_open(Q1CAM_SHM_NAME, O_CREAT | O_RDWR | O_TRUNC, 0600);
-+	if (fd < 0 || ftruncate(fd, sizeof(struct q1cam_shm)) != 0) {
-+		CAM_ERROR(c, "cannot create shared memory %s", Q1CAM_SHM_NAME);
-+		if (fd >= 0) {
-+			close(fd);
-+		}
-+		return false;
-+	}
-+	c->shm = mmap(NULL, sizeof(struct q1cam_shm), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-+	close(fd);
-+	if (c->shm == MAP_FAILED) {
-+		c->shm = NULL;
-+		return false;
-+	}
-+	c->shm->ncams = Q1CAM_N;
-+	c->shm->width = Q1CAM_W;
-+	c->shm->height = Q1CAM_H;
-+	c->shm->slots = Q1CAM_SLOTS;
-+	c->shm->version = Q1CAM_VERSION;
-+	load_calibration(c);
-+	__atomic_store_n(&c->shm->magic, Q1CAM_MAGIC, __ATOMIC_RELEASE);
-+	return true;
-+}
-+
-+
-+/*
-+ *
-+ * Capture.
-+ *
-+ */
-+
-+static void
-+set_exposure(struct quest1_cameras *c)
-+{
-+	struct sb_cam_egt cfg[4];
-+	memset(cfg, 0, sizeof(cfg));
-+	for (int i = 0; i < 4; i++) {
-+		cfg[i].exposure = (uint16_t)c->exposure_us;
-+		cfg[i].gain = c->gain_x16;
-+		cfg[i].tag = CAM_TAG_HEADSET;
-+	}
-+	c->api.set_exp_gain_tag(c->sb, cfg);
-+}
-+
-+//! The qcam sequence (MontereyCameraProvider order), up to streaming.
-+static bool
-+start_cameras(struct quest1_cameras *c)
-+{
-+	struct cam_api *a = &c->api;
-+	c->hal = a->open(0); // 8 bpp
-+	if (c->hal == NULL) {
-+		CAM_ERROR(c, "qcamera_open failed");
-+		return false;
-+	}
-+	c->n = a->num_sensors(c->hal) & 0xff;
-+	uint8_t mask = 0;
-+	int r = a->probe(c->sb, &mask);
-+	if (r != 0) {
-+		CAM_ERROR(c, "syncboss_camera_probe: %d", r);
-+		return false;
-+	}
-+	c->probed = true;
-+	if (c->n != Q1CAM_N || __builtin_popcount(mask) != Q1CAM_N) {
-+		CAM_ERROR(c, "expected 4 cameras: HAL %d, SyncBoss mask 0x%02x", c->n, mask);
-+		return false;
-+	}
-+	a->set_bpp(c->sb, 8);
-+	r = a->init(c->sb, Q1CAM_N);
-+	if (r != 0) {
-+		CAM_ERROR(c, "syncboss_camera_init: %d", r);
-+		return false;
-+	}
-+	c->inited = true;
-+
-+	struct qc_sensor_info info[Q1CAM_N];
-+	memset(info, 0, sizeof(info));
-+	for (int i = 0; i < Q1CAM_N; i++) {
-+		c->sensor[i] = a->get_sensor(c->hal, i);
-+		if (c->sensor[i] == NULL) {
-+			CAM_ERROR(c, "qcamera_get_sensor(%d) failed", i);
-+			return false;
-+		}
-+		a->query_info(c->sensor[i], &info[i]);
-+		if (info[i].width != Q1CAM_W || info[i].height != Q1CAM_H || info[i].bpp != 8) {
-+			CAM_ERROR(c, "camera %d: unexpected %ux%u, %u bpp", i, info[i].width, info[i].height, info[i].bpp);
-+			return false;
-+		}
-+	}
-+	a->set_frame_rate(c->sb, CAM_PERIOD_US);
-+	if (a->params(c->sb, c->params) != 0) {
-+		CAM_ERROR(c, "syncboss_camera_params failed");
-+		return false;
-+	}
-+	for (int i = 0; i < Q1CAM_N; i++) {
-+		r = a->start_sensor(c->sensor[i], &info[i].width, &info[i].format, CAM_NBUFS, NULL, 1);
-+		if (r != 0) {
-+			CAM_ERROR(c, "qcamera_start_sensor(%d): %d", i, r);
-+			return false;
-+		}
-+		c->started[i] = true;
-+	}
-+	a->set_tag_mode(c->sb, 1);
-+	r = a->start_streaming(c->sb, Q1CAM_N);
-+	c->streaming = true; // stop it even if the call reported an error
-+	if (r != 0) {
-+		CAM_ERROR(c, "syncboss_camera_start_streaming: %d", r);
-+		return false;
-+	}
-+	set_exposure(c);
-+	return true;
-+}
-+
-+static void
-+stop_cameras(struct quest1_cameras *c)
-+{
-+	struct cam_api *a = &c->api;
-+	if (c->streaming) {
-+		a->stop_streaming(c->sb, Q1CAM_N);
-+		c->streaming = false;
-+	}
-+	for (int i = 0; i < Q1CAM_N; i++) {
-+		if (c->started[i]) {
-+			a->stop_sensor(c->sensor[i]);
-+			c->started[i] = false;
-+		}
-+	}
-+	for (int i = 0; i < Q1CAM_N; i++) {
-+		if (c->sensor[i] != NULL) {
-+			a->release_sensor(c->sensor[i]);
-+			c->sensor[i] = NULL;
-+		}
-+	}
-+	if (c->hal != NULL) {
-+		a->close(c->hal);
-+		c->hal = NULL;
-+	}
-+	if (c->inited) {
-+		a->deinit(c->sb, Q1CAM_N);
-+		c->inited = false;
-+	}
-+	if (c->probed) {
-+		a->release(c->sb);
-+		c->probed = false;
-+	}
-+}
-+
-+//! Simple auto exposure on the mean of a pixel grid over all cameras.
-+static void
-+update_exposure(struct quest1_cameras *c, const struct q1cam_slot *s)
-+{
-+	uint64_t sum = 0, count = 0;
-+	for (int i = 0; i < Q1CAM_N; i++) {
-+		for (int y = 8; y < Q1CAM_H; y += 16) {
-+			for (int x = 8; x < Q1CAM_W; x += 16) {
-+				sum += s->pixels[i][y * Q1CAM_W + x];
-+				count++;
-+			}
-+		}
-+	}
-+	float mean = (float)sum / (float)count;
-+	float ratio = CAM_TARGET_MEAN / (mean < 1.0f ? 1.0f : mean);
-+	ratio = ratio < 0.7f ? 0.7f : (ratio > 1.4f ? 1.4f : ratio);
-+	// Exposure first; gain (from QUEST1_CAMERA_GAIN up to CAM_GAIN_MAX_X16) only at the exposure limit.
-+	int exp = c->exposure_us, gain = c->gain_x16;
-+	if (ratio > 1.0f && exp >= c->exposure_max_us) {
-+		gain = (int)((float)gain * ratio);
-+	} else if (ratio < 1.0f && gain > c->gain_min_x16) {
-+		gain = (int)((float)gain * ratio);
-+		gain = gain < c->gain_min_x16 ? c->gain_min_x16 : gain;
-+	} else {
-+		exp = (int)((float)exp * ratio);
-+	}
-+	exp = exp < CAM_EXP_MIN_US ? CAM_EXP_MIN_US : (exp > c->exposure_max_us ? c->exposure_max_us : exp);
-+	gain = gain > CAM_GAIN_MAX_X16 ? CAM_GAIN_MAX_X16 : gain;
-+	if (abs(exp - c->exposure_us) * 20 > c->exposure_us || abs(gain - c->gain_x16) * 20 > c->gain_x16) {
-+		CAM_DEBUG(c, "mean %.1f, exposure %d -> %d us, gain %d -> %d /16", mean, c->exposure_us, exp,
-+		          c->gain_x16, gain);
-+		c->exposure_us = exp;
-+		c->gain_x16 = (uint16_t)gain;
-+		set_exposure(c);
-+	}
-+}
-+
-+//! The newest recent shutter record with this frame-sync id (4 bits), 0 if none.
-+static int64_t
-+find_shutter_ns(struct quest1_cameras *c, uint8_t sync_id)
-+{
-+	int64_t now = os_monotonic_get_ns(), ts = 0;
-+	os_mutex_lock(&c->shutter_mutex);
-+	for (uint32_t i = 1; i <= CAM_SHUTTER_RING && i <= c->shutter_head; i++) {
-+		uint32_t k = (c->shutter_head - i) % CAM_SHUTTER_RING;
-+		if (now - c->shutter[k].recv_ns > CAM_SHUTTER_MAX_AGE_NS) {
-+			break;
-+		}
-+		if ((c->shutter[k].sync_id & 0xf) == (sync_id & 0xf)) {
-+			ts = (int64_t)(c->shutter[k].ts_us * U_TIME_1US_IN_NS);
-+			break;
-+		}
-+	}
-+	os_mutex_unlock(&c->shutter_mutex);
-+	return ts;
-+}
-+
-+//! Dequeues one frameset; HEADSET framesets are published. False on a dequeue timeout.
-+static bool
-+capture_frameset(struct quest1_cameras *c, uint64_t *seq)
-+{
-+	struct q1cam_slot *s = &c->shm->slot[(*seq + 1) % Q1CAM_SLOTS];
-+	// Readers still copying this slot must see that it changes under them.
-+	__atomic_store_n(&s->seq, 0, __ATOMIC_RELAXED);
-+	__atomic_thread_fence(__ATOMIC_RELEASE);
-+	struct qc_frame *f[Q1CAM_N];
-+	bool ok = true, headset = false;
-+	for (int i = 0; i < Q1CAM_N; i++) {
-+		f[i] = c->api.dequeue(c->sensor[i], CAM_DEQ_TIMEOUT_MS);
-+		if (f[i] == NULL || f[i]->data == NULL) {
-+			ok = false;
-+			continue;
-+		}
-+		struct sb_frame_meta m;
-+		memset(&m, 0, sizeof(m));
-+		c->api.decode_meta(f[i]->data, &m, c->params);
-+		if (i == 0) {
-+			headset = m.tag == CAM_TAG_HEADSET;
-+			s->timestamp_ns = f[i]->ts_sec * U_TIME_1S_IN_NS + f[i]->ts_nsec;
-+			s->sync_id = m.sync_id;
-+			s->shutter_ns = headset ? find_shutter_ns(c, m.sync_id) : 0;
-+		}
-+		if (headset) {
-+			memcpy(s->pixels[i], f[i]->data + Q1CAM_W, Q1CAM_W * Q1CAM_H); // skip the metadata line
-+			s->exposure_us[i] = m.exposure;
-+			s->gain_x16[i] = m.gain_x16;
-+		}
-+	}
-+	for (int i = 0; i < Q1CAM_N; i++) {
-+		if (f[i] != NULL) {
-+			c->api.enqueue(c->sensor[i], f[i]);
-+		}
-+	}
-+	if (ok && headset) {
-+		(*seq)++;
-+		__atomic_store_n(&s->seq, *seq, __ATOMIC_RELEASE);
-+		__atomic_store_n(&c->shm->latest, *seq, __ATOMIC_RELEASE);
-+		if (c->auto_exposure && *seq % 8 == 0) {
-+			update_exposure(c, s);
-+		}
-+	}
-+	return ok;
-+}
-+
-+static bool
-+demanded(struct quest1_cameras *c)
-+{
-+	int64_t demand = (int64_t)__atomic_load_n(&c->shm->demand_ns, __ATOMIC_ACQUIRE);
-+	return demand != 0 && os_monotonic_get_ns() - demand < CAM_DEMAND_TIMEOUT_NS;
-+}
-+
-+//! Idle until a reader asks for frames, stream while asked, power the cameras down afterwards.
-+static void *
-+camera_thread(void *ptr)
-+{
-+	struct quest1_cameras *c = ptr;
-+	os_thread_helper_name(&c->oth, "Quest1 cameras");
-+
-+	uint64_t seq = 0;
-+	int64_t retry_after_ns = 0;
-+	os_thread_helper_lock(&c->oth);
-+	while (os_thread_helper_is_running_locked(&c->oth)) {
-+		os_thread_helper_unlock(&c->oth);
-+
-+		if (!demanded(c) || os_monotonic_get_ns() < retry_after_ns) {
-+			os_nanosleep(CAM_IDLE_POLL_NS);
-+		} else if (!start_cameras(c)) {
-+			stop_cameras(c);
-+			retry_after_ns = os_monotonic_get_ns() + CAM_RETRY_NS;
-+		} else {
-+			CAM_INFO(c, "streaming (exposure %s %d us, gain %.1f)", c->auto_exposure ? "auto" : "fixed",
-+			         c->exposure_us, c->gain_x16 / 16.0f);
-+			__atomic_store_n(&c->shm->streaming, 1, __ATOMIC_RELEASE);
-+			uint64_t first = seq, timeouts = 0;
-+			while (demanded(c) && os_thread_helper_is_running(&c->oth)) {
-+				if (!capture_frameset(c, &seq) && ++timeouts % 50 == 0) {
-+					CAM_ERROR(c, "%llu dequeue timeouts", (unsigned long long)timeouts);
-+				}
-+			}
-+			__atomic_store_n(&c->shm->streaming, 0, __ATOMIC_RELEASE);
-+			stop_cameras(c);
-+			CAM_INFO(c, "stopped after %llu framesets", (unsigned long long)(seq - first));
-+		}
-+
-+		os_thread_helper_lock(&c->oth);
-+	}
-+	os_thread_helper_unlock(&c->oth);
-+	return NULL;
-+}
-+
-+
-+/*
-+ *
-+ * Exported functions.
-+ *
-+ */
-+
-+struct quest1_cameras *
-+quest1_cameras_start(void *sb_handle, enum u_logging_level log_level)
-+{
-+	struct quest1_cameras *c = U_TYPED_CALLOC(struct quest1_cameras);
-+	c->log_level = log_level;
-+	c->sb = sb_handle;
-+	int64_t exp = debug_get_num_option_quest1_camera_exposure();
-+	c->auto_exposure = exp <= 0;
-+	c->exposure_us = c->auto_exposure ? 8000 : (int)exp;
-+	c->gain_x16 = (uint16_t)(debug_get_float_option_quest1_camera_gain() * 16.0f + 0.5f);
-+	c->gain_min_x16 = c->gain_x16;
-+	c->exposure_max_us = (int)debug_get_num_option_quest1_camera_exposure_max();
-+	c->exposure_max_us = c->exposure_max_us < CAM_EXP_MIN_US   ? CAM_EXP_MIN_US
-+	                     : c->exposure_max_us > CAM_EXP_MAX_US ? CAM_EXP_MAX_US
-+	                                                           : c->exposure_max_us;
-+	if (c->auto_exposure && c->exposure_us > c->exposure_max_us) {
-+		c->exposure_us = c->exposure_max_us;
-+	}
-+	os_mutex_init(&c->shutter_mutex);
-+	os_thread_helper_init(&c->oth);
-+
-+	if (!load_api(c) || !create_shm(c) || os_thread_helper_start(&c->oth, camera_thread, c) != 0) {
-+		quest1_cameras_destroy(&c);
-+		return NULL;
-+	}
-+	return c;
-+}
-+
-+void
-+quest1_cameras_stop(struct quest1_cameras *c)
-+{
-+	if (c != NULL) {
-+		os_thread_helper_stop_and_wait(&c->oth); // the thread stops the cameras
-+	}
-+}
-+
-+void
-+quest1_cameras_destroy(struct quest1_cameras **c_ptr)
-+{
-+	struct quest1_cameras *c = *c_ptr;
-+	if (c == NULL) {
-+		return;
-+	}
-+	os_thread_helper_destroy(&c->oth); // stops the thread (and so the cameras) if still running
-+	os_mutex_destroy(&c->shutter_mutex);
-+	if (c->shm != NULL) {
-+		munmap(c->shm, sizeof(struct q1cam_shm));
-+		shm_unlink(Q1CAM_SHM_NAME);
-+	}
-+	free(c);
-+	*c_ptr = NULL;
-+}
-+
-+void
-+quest1_cameras_push_imu(struct quest1_cameras *c,
-+                        uint64_t timestamp_us,
-+                        const float accel[3],
-+                        const float gyro[3],
-+                        float temperature,
-+                        int64_t imu_to_monotonic_ns)
-+{
-+	if (c == NULL) {
-+		return;
-+	}
-+	struct q1cam_shm *shm = c->shm;
-+	uint64_t n = shm->imu_latest + 1; // only this thread writes
-+	struct q1cam_imu_sample *e = &shm->imu[n % Q1CAM_IMU_RING];
-+	__atomic_store_n(&e->seq, 0, __ATOMIC_RELAXED);
-+	__atomic_thread_fence(__ATOMIC_RELEASE);
-+	e->timestamp_ns = (int64_t)(timestamp_us * U_TIME_1US_IN_NS);
-+	memcpy(e->accel, accel, sizeof(e->accel));
-+	memcpy(e->gyro, gyro, sizeof(e->gyro));
-+	e->temperature = temperature;
-+	__atomic_store_n(&e->seq, n, __ATOMIC_RELEASE);
-+	__atomic_store_n(&shm->imu_to_monotonic_ns, imu_to_monotonic_ns, __ATOMIC_RELAXED);
-+	__atomic_store_n(&shm->imu_latest, n, __ATOMIC_RELEASE);
-+}
-+
-+void
-+quest1_cameras_push_shutter(struct quest1_cameras *c, uint64_t timestamp_us, uint8_t sync_id)
-+{
-+	if (c == NULL) {
-+		return;
-+	}
-+	os_mutex_lock(&c->shutter_mutex);
-+	uint32_t k = c->shutter_head++ % CAM_SHUTTER_RING;
-+	c->shutter[k].ts_us = timestamp_us;
-+	c->shutter[k].recv_ns = os_monotonic_get_ns();
-+	c->shutter[k].sync_id = sync_id;
-+	os_mutex_unlock(&c->shutter_mutex);
-+}
-diff --git a/src/xrt/drivers/quest1/quest1_cameras_shm.h b/src/xrt/drivers/quest1/quest1_cameras_shm.h
-new file mode 100644
-index 0000000..875f6a0
---- /dev/null
-+++ b/src/xrt/drivers/quest1/quest1_cameras_shm.h
-@@ -0,0 +1,84 @@
-+// Copyright 2026, Quest1-SteamOS contributors
-+// SPDX-License-Identifier: BSL-1.0
-+/*!
-+ * @file
-+ * @brief  Shared-memory layout of the tracking camera frames that the quest1 driver publishes
-+ *         (QUEST1_CAMERAS=0 turns it off). Plain C, no Monado headers: clients include it directly.
-+ *
-+ * The writer clears slot (n % Q1CAM_SLOTS)'s seq, fills the slot, sets its seq to n, then stores
-+ * latest = n (release). A reader loads latest (acquire), copies that slot and checks that its seq
-+ * is still n. The IMU ring works the same way, one sample per entry: imu[n % Q1CAM_IMU_RING].
-+ *
-+ * Two clocks: CLOCK_MONOTONIC (the ISP frame timestamps) and the SyncBoss MCU clock (IMU samples
-+ * and camera shutter times, in ns here). imu_to_monotonic_ns is the driver's current mapping,
-+ * monotonic = IMU clock + imu_to_monotonic_ns (smallest delivery delay, follows drift slowly).
-+ *
-+ * The cameras run only on demand: a reader stores CLOCK_MONOTONIC ns into demand_ns at least every
-+ * 0.5 s (the region is root-only, open it O_RDWR). The driver powers the cameras up when demand_ns
-+ * is fresh (startup takes about a second) and down 2 s after the last heartbeat.
-+ *
-+ * @ingroup drv_quest1
-+ */
-+
-+#pragma once
-+
-+#include <stdint.h>
-+
-+#define Q1CAM_SHM_NAME "/quest1-cameras"
-+#define Q1CAM_MAGIC 0x314d4351u // "QCM1"
-+#define Q1CAM_VERSION 3
-+#define Q1CAM_N 4
-+#define Q1CAM_W 640
-+#define Q1CAM_H 480
-+#define Q1CAM_SLOTS 3
-+#define Q1CAM_IMU_RING 4096 // about 4 s at 1 kHz
-+
-+//! Factory calibration from /persist/calibration/camera_calibration_v2.json.
-+struct q1cam_calib
-+{
-+	//! Row-major 4x4. Device frame: +X right, +Y up, +Z back; camera frame: OpenCV (+Z forward).
-+	float device_from_camera[16];
-+	float f, cx, cy; //!< PinholeSymmetric, pixels
-+	float k[6];      //!< Fisheye62 radial: theta_d = theta * (1 + k0 theta^2 + ... + k5 theta^12)
-+	float p[2];      //!< Fisheye62 tangential
-+	float pad;
-+};
-+
-+struct q1cam_slot
-+{
-+	uint64_t seq;
-+	int64_t timestamp_ns; //!< CLOCK_MONOTONIC ISP timestamp of camera 0 (frame end, not exposure)
-+	int64_t shutter_ns;   //!< SyncBoss shutter time, IMU clock; 0 if no shutter record matched
-+	uint16_t exposure_us[Q1CAM_N];
-+	uint8_t gain_x16[Q1CAM_N];
-+	uint8_t sync_id; //!< frame-sync id from the metadata line (4 bits)
-+	uint8_t pad[3];
-+	uint8_t pixels[Q1CAM_N][Q1CAM_W * Q1CAM_H]; //!< Y8, index = calibration Id
-+};
-+
-+//! Headset IMU sample as SyncBoss delivers it (1 kHz, IMU sensor axes, no calibration applied).
-+struct q1cam_imu_sample
-+{
-+	uint64_t seq;
-+	int64_t timestamp_ns; //!< IMU clock
-+	float accel[3];       //!< m/s^2
-+	float gyro[3];        //!< rad/s
-+	float temperature;    //!< deg C
-+	uint32_t pad;
-+};
-+
-+struct q1cam_shm
-+{
-+	uint32_t magic, version;
-+	uint32_t ncams, width, height, slots;
-+	uint32_t calib_valid; //!< bit i: calib[i] was loaded
-+	uint32_t streaming;   //!< 1 while the cameras run
-+	struct q1cam_calib calib[Q1CAM_N];
-+	uint64_t latest;    //!< 0 = no frame yet
-+	uint64_t demand_ns; //!< written by readers: CLOCK_MONOTONIC of their last heartbeat
-+	uint64_t imu_latest;         //!< 0 = no IMU sample yet
-+	int64_t imu_to_monotonic_ns; //!< see above
-+	uint64_t pad2[4];
-+	struct q1cam_slot slot[Q1CAM_SLOTS];
-+	struct q1cam_imu_sample imu[Q1CAM_IMU_RING];
-+};
 diff --git a/src/xrt/drivers/quest1/quest1_hmd.c b/src/xrt/drivers/quest1/quest1_hmd.c
 new file mode 100644
-index 0000000..866c87d
+index 0000000..c84a51b
 --- /dev/null
 +++ b/src/xrt/drivers/quest1/quest1_hmd.c
-@@ -0,0 +1,794 @@
+@@ -0,0 +1,898 @@
 +// Copyright 2026, Quest1-SteamOS contributors
 +// SPDX-License-Identifier: BSL-1.0
 +/*!
 + * @file
-+ * @brief  Native Quest 1 HMD: 3DoF from the SyncBoss IMU, display for the 2880x1600 framebuffer.
++ * @brief  Native Quest 1 HMD: 3DoF from the SyncBoss IMU, 6DoF with SLAM on the tracking cameras,
++ *         display for the 2880x1600 framebuffer.
 + *
 + * libsyncboss.so is Meta's bionic C library for the SyncBoss MCU; it is loaded
 + * with libhybris (the process needs LD_PRELOAD=libbionictls.so). Records come
 + * from a 32-entry ring at 1 kHz; layouts are in docs/syncboss-imu.md.
 + *
++ * The IMU samples are rectified with Meta's calibration (quest1_calib.c) into the device frame
++ * (+X right, +Y up, +Z back). With SLAM (quest1_slam.c, Basalt) the head pose comes from the
++ * tracker; until its first pose, or without it, from the 3DoF fusion. Frames and IMU samples
++ * both carry SyncBoss (MCU) times, mapped to CLOCK_MONOTONIC with the same offset.
++ *
 + * @ingroup drv_quest1
 + */
 +
 +#include "quest1_interface.h"
++#include "quest1_calib.h"
++#include "quest1_slam.h"
 +
 +#include "math/m_api.h"
 +#include "math/m_imu_3dof.h"
@@ -5963,11 +6553,23 @@ index 0000000..866c87d
 +android_dlsym(void *handle, const char *symbol);
 +
 +DEBUG_GET_ONCE_LOG_OPTION(quest1_log, "QUEST1_LOG", U_LOGGING_INFO)
-+// Head axis i = sign * IMU axis, e.g. "-y,x,z". Head frame: +X right, +Y up, +Z back.
-+// Calibrated on the device 2026-10-05: up = -x, look-down = +y, turn-left = -x, tilt-left = -z (IMU frame).
-+DEBUG_GET_ONCE_OPTION(quest1_imu_axes, "QUEST1_IMU_AXES", "-y,-x,-z")
++// Overrides the factory IMU rectification for the 3DoF fusion: head axis i = sign * raw IMU axis,
++// e.g. "-y,x,z". Head frame: +X right, +Y up, +Z back. Calibrated by hand on the device
++// 2026-10-05 as "-y,-x,-z" (up = -x, look-down = +y, turn-left = -x, tilt-left = -z), which is
++// what the factory rectification matrices are up to ~1%; that remap is also the fallback when
++// /persist/calibration cannot be read.
++DEBUG_GET_ONCE_OPTION(quest1_imu_axes, "QUEST1_IMU_AXES", NULL)
++#define Q1_FALLBACK_IMU_AXES "-y,-x,-z"
 +DEBUG_GET_ONCE_BOOL_OPTION(quest1_controllers, "QUEST1_CONTROLLERS", true)
 +DEBUG_GET_ONCE_BOOL_OPTION(quest1_cameras, "QUEST1_CAMERAS", true)
++//! 6DoF tracking with Basalt (needs QUEST1_CAMERAS and the calibration); falls back to 3DoF.
++DEBUG_GET_ONCE_BOOL_OPTION(quest1_slam, "QUEST1_SLAM", true)
++//! Calibration ids fed to SLAM in order; the first two must be the bottom stereo pair 0,2. "0,2,1,3" = all four.
++DEBUG_GET_ONCE_OPTION(quest1_slam_cams, "QUEST1_SLAM_CAMS", "0,2")
++//! Frame rate given to SLAM: 30 / QUEST1_SLAM_FRAME_DIVIDER Hz. Basalt's optical flow takes ~70 ms
++//! of CPU per stereo frameset on the SD835 and cannot keep up with 30 Hz; 15 Hz tracks as well
++//! offline (walking dataset).
++DEBUG_GET_ONCE_NUM_OPTION(quest1_slam_frame_divider, "QUEST1_SLAM_FRAME_DIVIDER", 2)
 +
 +#define Q1_TRACE(h, ...) U_LOG_XDEV_IFL_T(&h->base, h->log_level, __VA_ARGS__)
 +#define Q1_DEBUG(h, ...) U_LOG_XDEV_IFL_D(&h->base, h->log_level, __VA_ARGS__)
@@ -6118,7 +6720,12 @@ index 0000000..866c87d
 +	void *sb_handle;
 +	struct os_thread_helper oth;
 +
-+	//! IMU axis remap: head[i] = axis_sign[i] * imu[axis_index[i]].
++	//! Meta's calibration from /persist; have_calib false if unreadable.
++	struct quest1_calib calib;
++	bool have_calib;
++
++	//! 3DoF without the rectification: head[i] = axis_sign[i] * imu[axis_index[i]].
++	bool raw_axes;
 +	int axis_index[3];
 +	float axis_sign[3];
 +
@@ -6129,8 +6736,8 @@ index 0000000..866c87d
 +		struct xrt_vec3 gyro_bias;
 +		uint64_t still_since_ns;
 +		bool bias_valid;
-+		int64_t clock_offset_ns; //!< monotonic - IMU clock
-+		bool have_offset;
++		int64_t clock_offset_ns; //!< monotonic - IMU clock; read by the camera thread too (atomic)
++		bool have_offset;        //!< atomic
 +		uint64_t samples;
 +	} imu;
 +
@@ -6150,6 +6757,10 @@ index 0000000..866c87d
 +
 +	//! Tracking cameras, streamed on demand; NULL with QUEST1_CAMERAS=0.
 +	struct quest1_cameras *cameras;
++
++	//! 6DoF tracker; NULL without SLAM. Set before the cameras start, read by the IMU thread (atomic).
++	struct quest1_slam *slam;
++	struct quest1_slam *slam_unused; //!< started, but the cameras did not; destroyed with the device
 +};
 +
 +static inline struct quest1_hmd *
@@ -6225,15 +6836,23 @@ index 0000000..866c87d
 +	// The IMU clock is the MCU's: map it to monotonic with the smallest observed
 +	// delivery delay, letting it creep up slowly to follow drift.
 +	int64_t offset = now - (int64_t)imu_ns;
-+	if (!h->imu.have_offset || offset < h->imu.clock_offset_ns) {
-+		h->imu.clock_offset_ns = offset;
-+		h->imu.have_offset = true;
++	int64_t clock_offset = h->imu.clock_offset_ns;
++	if (!h->imu.have_offset || offset < clock_offset) {
++		clock_offset = offset;
 +	} else {
-+		h->imu.clock_offset_ns += (offset - h->imu.clock_offset_ns) / 4096;
++		clock_offset += (offset - clock_offset) / 4096;
 +	}
++	__atomic_store_n(&h->imu.clock_offset_ns, clock_offset, __ATOMIC_RELEASE);
++	__atomic_store_n(&h->imu.have_offset, true, __ATOMIC_RELEASE);
 +
-+	struct xrt_vec3 accel = remap(h, e->accel);
-+	struct xrt_vec3 gyro = remap(h, e->gyro);
++	struct xrt_vec3 rect_accel = {0}, rect_gyro = {0};
++	if (h->have_calib) {
++		quest1_calib_rectify_imu(&h->calib.imu, e->temperature, e->accel, e->gyro, &rect_accel, &rect_gyro);
++		quest1_slam_push_imu(__atomic_load_n(&h->slam, __ATOMIC_ACQUIRE), (int64_t)imu_ns + clock_offset,
++		                     &rect_accel, &rect_gyro);
++	}
++	struct xrt_vec3 accel = h->raw_axes ? remap(h, e->accel) : rect_accel;
++	struct xrt_vec3 gyro = h->raw_axes ? remap(h, e->gyro) : rect_gyro;
 +	update_gyro_bias(h, imu_ns, &accel, &gyro);
 +	struct xrt_vec3 gyro_unbiased = m_vec3_sub(gyro, h->imu.gyro_bias);
 +
@@ -6257,6 +6876,38 @@ index 0000000..866c87d
 +		         (unsigned long long)h->imu.samples, h->imu.gyro_bias.x, h->imu.gyro_bias.y,
 +		         h->imu.gyro_bias.z, e->temperature);
 +	}
++}
++
++//! Camera thread: a HEADSET frameset for SLAM, on the IMU's monotonic mapping.
++static void
++on_frameset(void *data, int64_t shutter_ns, const uint8_t *const pixels[4])
++{
++	struct quest1_hmd *h = data;
++	if (!__atomic_load_n(&h->imu.have_offset, __ATOMIC_ACQUIRE)) {
++		return;
++	}
++	int64_t offset = __atomic_load_n(&h->imu.clock_offset_ns, __ATOMIC_ACQUIRE);
++	quest1_slam_push_frameset(h->slam, shutter_ns + offset, pixels);
++}
++
++static bool
++parse_slam_cams(const char *spec, int ids[QUEST1_CALIB_CAMS], int *count)
++{
++	*count = 0;
++	unsigned seen = 0;
++	for (const char *p = spec; *p != '\0';) {
++		if (*p < '0' || *p > '3' || *count == QUEST1_CALIB_CAMS || (seen & (1u << (*p - '0')))) {
++			return false;
++		}
++		seen |= 1u << (*p - '0');
++		ids[(*count)++] = *p++ - '0';
++		if (*p == ',') {
++			p++;
++		} else if (*p != '\0') {
++			return false;
++		}
++	}
++	return *count >= 2;
 +}
 +
 +static int
@@ -6443,6 +7094,9 @@ index 0000000..866c87d
 +		U_LOG_XDEV_UNSUPPORTED_INPUT(&h->base, h->log_level, name);
 +		return XRT_ERROR_INPUT_UNSUPPORTED;
 +	}
++	if (quest1_slam_get_pose(h->slam, at_timestamp_ns, out_relation)) {
++		return XRT_SUCCESS;
++	}
 +	struct xrt_space_relation rel = XRT_SPACE_RELATION_ZERO;
 +	if (m_relation_history_get(h->history, at_timestamp_ns, &rel) == M_RELATION_HISTORY_RESULT_INVALID) {
 +		rel.pose.orientation.w = 1.0f;
@@ -6478,6 +7132,8 @@ index 0000000..866c87d
 +	quest1_cameras_stop(h->cameras);
 +	os_thread_helper_destroy(&h->oth);
 +	quest1_cameras_destroy(&h->cameras);
++	quest1_slam_destroy(&h->slam); // after the IMU and camera threads, which feed it
++	quest1_slam_destroy(&h->slam_unused);
 +	if (h->sb_handle != NULL) {
 +		if (h->sb.imu_disable != NULL) {
 +			h->sb.imu_disable(h->sb_handle);
@@ -6645,8 +7301,13 @@ index 0000000..866c87d
 +	os_mutex_init(&h->ctrl_mutex);
 +	setup_display(h);
 +
++	h->have_calib = quest1_calib_load(&h->calib, h->log_level);
 +	const char *axes = debug_get_option_quest1_imu_axes();
-+	if (!parse_axes(h, axes)) {
++	h->raw_axes = axes != NULL || !h->have_calib;
++	if (axes == NULL) {
++		axes = Q1_FALLBACK_IMU_AXES;
++	}
++	if (h->raw_axes && !parse_axes(h, axes)) {
 +		Q1_ERROR(h, "bad QUEST1_IMU_AXES '%s', expected e.g. '-y,x,z'", axes);
 +		goto err;
 +	}
@@ -6688,16 +7349,41 @@ index 0000000..866c87d
 +		}
 +	}
 +
-+	if (debug_get_bool_option_quest1_cameras()) {
-+		__atomic_store_n(&h->cameras, quest1_cameras_start(h->sb_handle, h->log_level), __ATOMIC_RELEASE);
++	if (debug_get_bool_option_quest1_cameras() && debug_get_bool_option_quest1_slam() && h->have_calib) {
++		int ids[QUEST1_CALIB_CAMS], count;
++		const char *spec = debug_get_option_quest1_slam_cams();
++		if (!parse_slam_cams(spec, ids, &count)) {
++			Q1_ERROR(h, "bad QUEST1_SLAM_CAMS '%s', expected e.g. '0,2' or '0,2,1,3'", spec);
++		} else {
++			if (ids[0] != 0 || ids[1] != 2) {
++				Q1_ERROR(h, "QUEST1_SLAM_CAMS '%s': Basalt's cam0/cam1 should be the stereo pair 0,2", spec);
++			}
++			__atomic_store_n(&h->slam, quest1_slam_create(&h->calib, ids, count,
++			                                    (int)debug_get_num_option_quest1_slam_frame_divider(),
++			                                    h->log_level),
++			                 __ATOMIC_RELEASE);
++		}
 +	}
++	if (debug_get_bool_option_quest1_cameras()) {
++		struct quest1_cameras *cams =
++		    quest1_cameras_start(h->sb_handle, h->log_level, h->slam != NULL ? on_frameset : NULL, h);
++		__atomic_store_n(&h->cameras, cams, __ATOMIC_RELEASE);
++		if (cams == NULL && h->slam != NULL) {
++			// No frames for SLAM: stop using it; the IMU thread may still be pushing to it.
++			h->slam_unused = __atomic_exchange_n(&h->slam, NULL, __ATOMIC_ACQ_REL);
++		}
++	}
++	h->base.supported.position_tracking = h->slam != NULL;
++	snprintf(h->base.tracking_origin->name, XRT_TRACKING_NAME_LEN, "%s",
++	         h->slam != NULL ? "Quest 1 SLAM" : "Quest 1 IMU");
 +
 +	u_var_add_root(h, "Quest 1 HMD", true);
 +	u_var_add_log_level(h, &h->log_level, "log_level");
 +	u_var_add_ro_vec3_f32(h, &h->imu.gyro_bias, "gyro_bias");
 +	m_imu_3dof_add_vars(&h->imu.fusion, h, "fusion.");
 +
-+	Q1_INFO(h, "IMU running (axes %s)", axes);
++	Q1_INFO(h, "IMU running (%s%s), %s", h->raw_axes ? "axes " : "factory rectification",
++	        h->raw_axes ? axes : "", h->slam != NULL ? "6DoF with SLAM" : "3DoF");
 +	return &h->base;
 +
 +err:
@@ -6718,10 +7404,10 @@ index 0000000..866c87d
 +}
 diff --git a/src/xrt/drivers/quest1/quest1_interface.h b/src/xrt/drivers/quest1/quest1_interface.h
 new file mode 100644
-index 0000000..23734bc
+index 0000000..4c15b29
 --- /dev/null
 +++ b/src/xrt/drivers/quest1/quest1_interface.h
-@@ -0,0 +1,125 @@
+@@ -0,0 +1,132 @@
 +// Copyright 2026, Quest1-SteamOS contributors
 +// SPDX-License-Identifier: BSL-1.0
 +/*!
@@ -6751,7 +7437,7 @@ index 0000000..23734bc
 +bool
 +quest1_detect(void);
 +
-+//! 3DoF HMD, display set up for the 2880x1600 framebuffer that the panels show rotated by 180°.
++//! HMD (3DoF, 6DoF with SLAM), display set up for the 2880x1600 framebuffer that the panels show rotated by 180°.
 +struct xrt_device *
 +quest1_hmd_create(void);
 +
@@ -6794,8 +7480,15 @@ index 0000000..23734bc
 +//! Tracking cameras on the HMD's SyncBoss handle, frames in shared memory (quest1_cameras_shm.h).
 +struct quest1_cameras;
 +
++/*!
++ * Called from the camera thread for every HEADSET frameset with a SyncBoss shutter time
++ * (mid-exposure, IMU clock, ns); pixels are 640x480 Y8 by calibration Id, valid during the call.
++ */
++typedef void (*quest1_frameset_fn)(void *data, int64_t shutter_ns, const uint8_t *const pixels[4]);
++
++//! With a consumer the cameras stream all the time, otherwise only while a shm reader asks.
 +struct quest1_cameras *
-+quest1_cameras_start(void *sb_handle, enum u_logging_level log_level);
++quest1_cameras_start(void *sb_handle, enum u_logging_level log_level, quest1_frameset_fn consumer, void *consumer_data);
 +
 +//! Stops the camera thread (and the cameras); the IMU thread may still push. c may be NULL.
 +void
@@ -6843,6 +7536,536 @@ index 0000000..23734bc
 +
 +void
 +quest1_controller_set_haptic_fn(struct quest1_controller *c, quest1_haptic_fn fn, void *data);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/src/xrt/drivers/quest1/quest1_slam.c b/src/xrt/drivers/quest1/quest1_slam.c
+new file mode 100644
+index 0000000..f8042db
+--- /dev/null
++++ b/src/xrt/drivers/quest1/quest1_slam.c
+@@ -0,0 +1,462 @@
++// Copyright 2026, Quest1-SteamOS contributors
++// SPDX-License-Identifier: BSL-1.0
++/*!
++ * @file
++ * @brief  Quest 1 6DoF head tracking through Monado's SLAM tracker (t_slam, VIT, Basalt).
++ *
++ * Frames: Basalt's IMU frame is the frame of the rectified IMU samples, i.e. the calibration's
++ * device frame (+X right, +Y up, +Z back; DeviceFromImu is a pure translation). Cameras are
++ * given as T_imu_cam = inv(DeviceFromImu) * DeviceFromCamera. Basalt reports T_world_imu with
++ * the world +Z up (gravity along -Z, yaw from the first IMU sample). OpenXR wants +Y up, so the
++ * pose is rotated by -90 deg about X, then moved from the IMU to the device origin:
++ * world_xr_from_device = Rx(-90) * T_world_imu * inv(DeviceFromImu).
++ *
++ * The SyncBoss IMU thread and the camera thread hand their data to two feeder threads here, one
++ * for IMU samples and one for frames, which push it into the tracker: Basalt's bounded input
++ * queues block when it falls behind, and the IMU thread also pumps the SyncBoss stream for the
++ * controllers and the cameras. One feeder for both deadlocks once Basalt lags: blocked on a full
++ * image queue it stops delivering the IMU samples that Basalt's VIO waits for.
++ *
++ * @ingroup drv_quest1
++ */
++
++#include "quest1_slam.h"
++
++#include "xrt/xrt_config_build.h"
++#include "xrt/xrt_frame.h"
++#include "xrt/xrt_tracking.h"
++
++#include "math/m_api.h"
++#include "math/m_space.h"
++#include "math/m_vec3.h"
++#include "os/os_threading.h"
++#include "os/os_time.h"
++#include "util/u_debug.h"
++#include "util/u_frame.h"
++#include "util/u_logging.h"
++#include "util/u_misc.h"
++#include "util/u_time.h"
++
++#ifdef XRT_FEATURE_SLAM
++#include "tracking/t_tracking.h"
++#endif
++
++#include <stdlib.h>
++#include <string.h>
++
++#define SLAM_ERROR(s, ...) U_LOG_IFL_E(s->log_level, "slam: " __VA_ARGS__)
++#define SLAM_WARN(s, ...) U_LOG_IFL_W(s->log_level, "slam: " __VA_ARGS__)
++#define SLAM_INFO(s, ...) U_LOG_IFL_I(s->log_level, "slam: " __VA_ARGS__)
++#define SLAM_DEBUG(s, ...) U_LOG_IFL_D(s->log_level, "slam: " __VA_ARGS__)
++
++#define SLAM_IMU_RING 1024 // 1 s at 1 kHz
++#define SLAM_CAM_HZ 30.0
++#define SLAM_IMU_HZ 1000.0
++#define SLAM_STATS_PERIOD_NS (10 * (int64_t)U_TIME_1S_IN_NS)
++#define SLAM_DEFAULT_VIT "/opt/basalt/lib/libbasalt.so"
++// Basalt has no failure signal: VIO that lost its landmarks drifts away with the IMU, quadratically.
++// Head motion stays far below these; beyond them the driver resets the tracker (new origin) and
++// reports 3DoF until the poses are plausible again.
++#define SLAM_MAX_SPEED_M_S 3.0f
++#define SLAM_MAX_DISTANCE_M 10.0f
++#define SLAM_RESET_INTERVAL_NS (3 * (int64_t)U_TIME_1S_IN_NS)
++
++// IMU noise: the Rift S driver's values (rift_s_tracker.c), validated offline on Quest 1 datasets.
++#define SLAM_ACCEL_NOISE 0.016
++#define SLAM_ACCEL_BIAS 0.001
++#define SLAM_GYRO_NOISE 0.000282
++#define SLAM_GYRO_BIAS 0.0001
++
++#ifdef XRT_FEATURE_SLAM
++
++struct quest1_slam
++{
++	enum u_logging_level log_level;
++	struct xrt_frame_context xfctx;
++	struct xrt_tracked_slam *tracker;
++	struct xrt_slam_sinks *sinks;
++	struct t_slam_calibration calib;
++	int cam_count;
++	int cam_ids[QUEST1_CALIB_CAMS];
++	int width, height;
++	int frame_divider;
++	uint64_t frameset_counter; //!< only the camera thread
++	struct xrt_pose imu_from_device;
++
++	//! IMU feeder; its mutex guards the ring.
++	struct os_thread_helper imu_oth;
++	struct xrt_imu_sample imu[SLAM_IMU_RING];
++	uint32_t imu_head, imu_tail; //!< written at head, read at tail
++	int64_t last_imu_in_ts;
++
++	//! Frame feeder; its mutex guards the pending frameset.
++	struct os_thread_helper frame_oth;
++	struct xrt_frame *pending[QUEST1_CALIB_CAMS]; //!< newest unsent frameset, NULL = none
++	int64_t pending_ts;
++
++	//! Updated with __atomic builtins.
++	struct
++	{
++		uint64_t imu_in, imu_dropped, framesets_in, framesets_dropped, framesets_pushed;
++	} stats;
++
++	//! Only the frame feeder.
++	int64_t last_frame_ts, last_stats_ns;
++
++	//! Serialises t_slam_get_tracked_pose (it caches the last request).
++	struct os_mutex pose_mutex;
++	int64_t last_reset_ns; //!< protected by pose_mutex
++	uint32_t resets;       //!< protected by pose_mutex
++};
++
++static void
++fill_calibration(struct quest1_slam *s, const struct quest1_calib *calib)
++{
++	struct t_slam_imu_calibration *imu = &s->calib.imu;
++	memset(imu, 0, sizeof(*imu));
++	imu->frequency = SLAM_IMU_HZ;
++	// The samples arrive rectified: identity transforms, zero offsets.
++	for (int i = 0; i < 3; i++) {
++		imu->base.accel.transform[i][i] = 1.0;
++		imu->base.gyro.transform[i][i] = 1.0;
++		imu->base.accel.noise_std[i] = SLAM_ACCEL_NOISE;
++		imu->base.accel.bias_std[i] = SLAM_ACCEL_BIAS;
++		imu->base.gyro.noise_std[i] = SLAM_GYRO_NOISE;
++		imu->base.gyro.bias_std[i] = SLAM_GYRO_BIAS;
++	}
++
++	struct xrt_matrix_4x4 m;
++	struct xrt_pose device_from_imu;
++	math_matrix_4x4_transpose((const struct xrt_matrix_4x4 *)calib->imu.device_from_imu, &m); // to column-major
++	math_pose_from_isometry(&m, &device_from_imu);
++	math_pose_invert(&device_from_imu, &s->imu_from_device);
++
++	s->calib.cam_count = s->cam_count;
++	for (int n = 0; n < s->cam_count; n++) {
++		const struct quest1_cam_calib *c = &calib->cam[s->cam_ids[n]];
++		struct xrt_pose device_from_cam, imu_from_cam;
++		math_matrix_4x4_transpose((const struct xrt_matrix_4x4 *)c->device_from_camera, &m);
++		math_pose_from_isometry(&m, &device_from_cam);
++		math_pose_transform(&s->imu_from_device, &device_from_cam, &imu_from_cam);
++
++		struct t_slam_camera_calibration *sc = &s->calib.cams[n];
++		memset(sc, 0, sizeof(*sc));
++		sc->frequency = SLAM_CAM_HZ / s->frame_divider;
++		math_matrix_4x4_isometry_from_pose(&imu_from_cam, &sc->T_imu_cam);
++		sc->base.image_size_pixels.w = c->width;
++		sc->base.image_size_pixels.h = c->height;
++		sc->base.intrinsics[0][0] = c->f;
++		sc->base.intrinsics[1][1] = c->f;
++		sc->base.intrinsics[0][2] = c->cx;
++		sc->base.intrinsics[1][2] = c->cy;
++		sc->base.intrinsics[2][2] = 1.0;
++		sc->base.distortion_model = T_DISTORTION_FISHEYE_KB4;
++		sc->base.kb4.k1 = c->kb4[0];
++		sc->base.kb4.k2 = c->kb4[1];
++		sc->base.kb4.k3 = c->kb4[2];
++		sc->base.kb4.k4 = c->kb4[3];
++		SLAM_INFO(s, "cam%d = camera %d, T_imu_cam p [%.4f %.4f %.4f] q [%.4f %.4f %.4f %.4f]", n, s->cam_ids[n],
++		          imu_from_cam.position.x, imu_from_cam.position.y, imu_from_cam.position.z,
++		          imu_from_cam.orientation.x, imu_from_cam.orientation.y, imu_from_cam.orientation.z,
++		          imu_from_cam.orientation.w);
++	}
++}
++
++static void
++log_stats(struct quest1_slam *s, int64_t now)
++{
++	typeof(s->stats) st;
++	st.imu_in = __atomic_load_n(&s->stats.imu_in, __ATOMIC_RELAXED);
++	st.imu_dropped = __atomic_load_n(&s->stats.imu_dropped, __ATOMIC_RELAXED);
++	st.framesets_in = __atomic_load_n(&s->stats.framesets_in, __ATOMIC_RELAXED);
++	st.framesets_dropped = __atomic_load_n(&s->stats.framesets_dropped, __ATOMIC_RELAXED);
++	st.framesets_pushed = __atomic_load_n(&s->stats.framesets_pushed, __ATOMIC_RELAXED);
++
++	struct xrt_space_relation rel = XRT_SPACE_RELATION_ZERO;
++	bool ok = quest1_slam_get_pose(s, now, &rel);
++	os_mutex_lock(&s->pose_mutex);
++	uint32_t resets = s->resets;
++	os_mutex_unlock(&s->pose_mutex);
++	SLAM_INFO(s,
++	          "framesets %llu in, %llu pushed, %llu dropped; IMU %llu in, %llu dropped; resets %u; "
++	          "pose %s p [%.3f %.3f %.3f] q [%.3f %.3f %.3f %.3f]",
++	          (unsigned long long)st.framesets_in, (unsigned long long)st.framesets_pushed,
++	          (unsigned long long)st.framesets_dropped, (unsigned long long)st.imu_in,
++	          (unsigned long long)st.imu_dropped, resets, ok ? "tracked" : "none", rel.pose.position.x, rel.pose.position.y,
++	          rel.pose.position.z, rel.pose.orientation.x, rel.pose.orientation.y, rel.pose.orientation.z,
++	          rel.pose.orientation.w);
++}
++
++static void *
++imu_feeder(void *ptr)
++{
++	struct quest1_slam *s = ptr;
++	os_thread_helper_name(&s->imu_oth, "Quest1 SLAM IMU");
++	struct xrt_imu_sample batch[64];
++
++	os_thread_helper_lock(&s->imu_oth);
++	while (os_thread_helper_is_running_locked(&s->imu_oth)) {
++		if (s->imu_head == s->imu_tail) {
++			os_thread_helper_wait_locked(&s->imu_oth);
++			continue;
++		}
++		uint32_t n = 0;
++		while (s->imu_tail != s->imu_head && n < ARRAY_SIZE(batch)) {
++			batch[n++] = s->imu[s->imu_tail++ % SLAM_IMU_RING];
++		}
++		os_thread_helper_unlock(&s->imu_oth);
++		for (uint32_t i = 0; i < n; i++) {
++			xrt_sink_push_imu(s->sinks->imus[0], &batch[i]);
++		}
++		os_thread_helper_lock(&s->imu_oth);
++	}
++	os_thread_helper_unlock(&s->imu_oth);
++	return NULL;
++}
++
++static void *
++frame_feeder(void *ptr)
++{
++	struct quest1_slam *s = ptr;
++	os_thread_helper_name(&s->frame_oth, "Quest1 SLAM cam");
++
++	os_thread_helper_lock(&s->frame_oth);
++	while (os_thread_helper_is_running_locked(&s->frame_oth)) {
++		if (s->pending[0] == NULL) {
++			os_thread_helper_wait_locked(&s->frame_oth);
++			continue;
++		}
++		struct xrt_frame *frames[QUEST1_CALIB_CAMS];
++		memcpy(frames, s->pending, sizeof(frames));
++		memset(s->pending, 0, sizeof(s->pending));
++		int64_t frame_ts = s->pending_ts;
++		os_thread_helper_unlock(&s->frame_oth);
++
++		if (frame_ts > s->last_frame_ts) {
++			s->last_frame_ts = frame_ts;
++			for (int i = 0; i < s->cam_count; i++) {
++				xrt_sink_push_frame(s->sinks->cams[i], frames[i]);
++			}
++			__atomic_add_fetch(&s->stats.framesets_pushed, 1, __ATOMIC_RELAXED);
++		}
++		for (int i = 0; i < s->cam_count; i++) {
++			xrt_frame_reference(&frames[i], NULL);
++		}
++
++		int64_t now = os_monotonic_get_ns();
++		if (now - s->last_stats_ns > SLAM_STATS_PERIOD_NS) {
++			s->last_stats_ns = now;
++			log_stats(s, now);
++		}
++
++		os_thread_helper_lock(&s->frame_oth);
++	}
++	os_thread_helper_unlock(&s->frame_oth);
++	return NULL;
++}
++
++struct quest1_slam *
++quest1_slam_create(const struct quest1_calib *calib,
++                   const int *cam_ids,
++                   int cam_count,
++                   int frame_divider,
++                   enum u_logging_level log_level)
++{
++	if (cam_count < 2 || cam_count > QUEST1_CALIB_CAMS) {
++		U_LOG_IFL_E(log_level, "slam: need 2 to %d cameras, got %d", QUEST1_CALIB_CAMS, cam_count);
++		return NULL;
++	}
++	struct quest1_slam *s = U_TYPED_CALLOC(struct quest1_slam);
++	s->log_level = log_level;
++	s->cam_count = cam_count;
++	s->frame_divider = frame_divider < 1 ? 1 : frame_divider;
++	memcpy(s->cam_ids, cam_ids, sizeof(int) * cam_count);
++	s->width = calib->cam[cam_ids[0]].width;
++	s->height = calib->cam[cam_ids[0]].height;
++	s->last_imu_in_ts = INT64_MIN;
++	s->last_frame_ts = INT64_MIN;
++	os_thread_helper_init(&s->imu_oth);
++	os_thread_helper_init(&s->frame_oth);
++	os_mutex_init(&s->pose_mutex);
++	fill_calibration(s, calib);
++
++	struct t_slam_tracker_config config;
++	t_slam_fill_default_config(&config);
++	if (getenv("VIT_SYSTEM_LIBRARY_PATH") == NULL) {
++		config.vit_system_library_path = SLAM_DEFAULT_VIT;
++	}
++	config.cam_count = cam_count;
++	config.slam_calib = &s->calib;
++	config.submit_from_start = true;
++	if (config.slam_config != NULL) {
++		SLAM_WARN(s, "SLAM_CONFIG=%s replaces the driver's calibration", config.slam_config);
++	}
++
++	if (t_slam_create(&s->xfctx, &config, &s->tracker, &s->sinks) != 0 || t_slam_start(s->tracker) != 0) {
++		SLAM_ERROR(s, "cannot start the SLAM tracker (VIT library %s)", config.vit_system_library_path);
++		quest1_slam_destroy(&s);
++		return NULL;
++	}
++	if (os_thread_helper_start(&s->imu_oth, imu_feeder, s) != 0 ||
++	    os_thread_helper_start(&s->frame_oth, frame_feeder, s) != 0) {
++		quest1_slam_destroy(&s);
++		return NULL;
++	}
++	SLAM_INFO(s, "tracker running with %d cameras at %.0f Hz (%s)", cam_count, SLAM_CAM_HZ / s->frame_divider,
++	          config.vit_system_library_path);
++	return s;
++}
++
++void
++quest1_slam_push_imu(struct quest1_slam *s, int64_t ts, const struct xrt_vec3 *accel, const struct xrt_vec3 *gyro)
++{
++	if (s == NULL) {
++		return;
++	}
++	os_thread_helper_lock(&s->imu_oth);
++	__atomic_add_fetch(&s->stats.imu_in, 1, __ATOMIC_RELAXED);
++	// Strictly increasing, as the tracker requires; the clock offset filter can step back slightly.
++	if (ts <= s->last_imu_in_ts) {
++		ts = s->last_imu_in_ts + 1;
++	}
++	s->last_imu_in_ts = ts;
++	if (s->imu_head - s->imu_tail >= SLAM_IMU_RING) {
++		s->imu_tail++; // the tracker fell behind: drop the oldest
++		__atomic_add_fetch(&s->stats.imu_dropped, 1, __ATOMIC_RELAXED);
++	}
++	struct xrt_imu_sample *e = &s->imu[s->imu_head++ % SLAM_IMU_RING];
++	e->timestamp_ns = ts;
++	e->accel_m_s2 = (struct xrt_vec3_f64){accel->x, accel->y, accel->z};
++	e->gyro_rad_secs = (struct xrt_vec3_f64){gyro->x, gyro->y, gyro->z};
++	os_thread_helper_signal_locked(&s->imu_oth);
++	os_thread_helper_unlock(&s->imu_oth);
++}
++
++void
++quest1_slam_push_frameset(struct quest1_slam *s, int64_t ts, const uint8_t *const pixels[QUEST1_CALIB_CAMS])
++{
++	if (s == NULL || s->frameset_counter++ % s->frame_divider != 0) {
++		return;
++	}
++	struct xrt_frame *frames[QUEST1_CALIB_CAMS] = {0};
++	for (int i = 0; i < s->cam_count; i++) {
++		u_frame_create_one_off(XRT_FORMAT_L8, s->width, s->height, &frames[i]);
++		memcpy(frames[i]->data, pixels[s->cam_ids[i]], (size_t)s->width * s->height);
++		frames[i]->timestamp = ts;
++		frames[i]->source_timestamp = ts;
++		frames[i]->source_sequence = (uint64_t)ts;
++	}
++
++	struct xrt_frame *old[QUEST1_CALIB_CAMS] = {0};
++	__atomic_add_fetch(&s->stats.framesets_in, 1, __ATOMIC_RELAXED);
++	os_thread_helper_lock(&s->frame_oth);
++	if (s->pending[0] != NULL) {
++		memcpy(old, s->pending, sizeof(old)); // the tracker fell behind: replace the unsent frameset
++		__atomic_add_fetch(&s->stats.framesets_dropped, 1, __ATOMIC_RELAXED);
++	}
++	memcpy(s->pending, frames, sizeof(frames));
++	s->pending_ts = ts;
++	os_thread_helper_signal_locked(&s->frame_oth);
++	os_thread_helper_unlock(&s->frame_oth);
++
++	for (int i = 0; i < s->cam_count; i++) {
++		xrt_frame_reference(&old[i], NULL);
++	}
++}
++
++//! Basalt's T_world_imu (+Z up) to the device pose in a +Y up world.
++bool
++quest1_slam_get_pose(struct quest1_slam *s, int64_t at_ns, struct xrt_space_relation *out)
++{
++	if (s == NULL) {
++		return false;
++	}
++	struct xrt_space_relation imu_rel = XRT_SPACE_RELATION_ZERO;
++	os_mutex_lock(&s->pose_mutex);
++	xrt_tracked_slam_get_tracked_pose(s->tracker, at_ns, &imu_rel);
++	if ((imu_rel.relation_flags & XRT_SPACE_RELATION_ORIENTATION_VALID_BIT) == 0) {
++		os_mutex_unlock(&s->pose_mutex);
++		return false;
++	}
++	float speed = m_vec3_len(imu_rel.linear_velocity), dist = m_vec3_len(imu_rel.pose.position);
++	if (!(speed < SLAM_MAX_SPEED_M_S) || !(dist < SLAM_MAX_DISTANCE_M)) {
++		int64_t now = os_monotonic_get_ns();
++		if (now - s->last_reset_ns > SLAM_RESET_INTERVAL_NS) {
++			s->last_reset_ns = now;
++			s->resets++;
++			SLAM_WARN(s, "tracking diverged (%.1f m/s, %.1f m from the origin): reset %u", speed, dist,
++			          s->resets);
++			t_slam_reset(s->tracker);
++		}
++		os_mutex_unlock(&s->pose_mutex);
++		return false;
++	}
++	os_mutex_unlock(&s->pose_mutex);
++	imu_rel.relation_flags = (enum xrt_space_relation_flags)(
++	    XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_POSITION_VALID_BIT |
++	    XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT | XRT_SPACE_RELATION_POSITION_TRACKED_BIT |
++	    (imu_rel.relation_flags &
++	     (XRT_SPACE_RELATION_LINEAR_VELOCITY_VALID_BIT | XRT_SPACE_RELATION_ANGULAR_VELOCITY_VALID_BIT)));
++
++	const struct xrt_pose z_up_to_y_up = {{-0.70710678f, 0.0f, 0.0f, 0.70710678f}, {0.0f, 0.0f, 0.0f}};
++	struct xrt_relation_chain xrc = {0};
++	m_relation_chain_push_pose(&xrc, &s->imu_from_device);
++	m_relation_chain_push_relation(&xrc, &imu_rel);
++	m_relation_chain_push_pose(&xrc, &z_up_to_y_up);
++	m_relation_chain_resolve(&xrc, out);
++	return true;
++}
++
++void
++quest1_slam_destroy(struct quest1_slam **s_ptr)
++{
++	struct quest1_slam *s = *s_ptr;
++	if (s == NULL) {
++		return;
++	}
++	// A feeder blocked in one of Basalt's full queues returns once the running tracker drains it.
++	// The IMU feeder goes first: Basalt only consumes IMU samples while frames keep coming.
++	// Then the tracker, which must not be destroyed under a feeder.
++	os_thread_helper_destroy(&s->imu_oth);
++	os_thread_helper_destroy(&s->frame_oth);
++	xrt_frame_context_destroy_nodes(&s->xfctx);
++	for (int i = 0; i < QUEST1_CALIB_CAMS; i++) {
++		xrt_frame_reference(&s->pending[i], NULL);
++	}
++	os_mutex_destroy(&s->pose_mutex);
++	free(s);
++	*s_ptr = NULL;
++}
++
++#else // XRT_FEATURE_SLAM
++
++struct quest1_slam *
++quest1_slam_create(const struct quest1_calib *calib,
++                   const int *cam_ids,
++                   int cam_count,
++                   int frame_divider,
++                   enum u_logging_level log_level)
++{
++	U_LOG_IFL_I(log_level, "slam: Monado was built without XRT_FEATURE_SLAM, 3DoF only");
++	return NULL;
++}
++
++void
++quest1_slam_push_imu(struct quest1_slam *s, int64_t ts, const struct xrt_vec3 *accel, const struct xrt_vec3 *gyro)
++{}
++
++void
++quest1_slam_push_frameset(struct quest1_slam *s, int64_t ts, const uint8_t *const pixels[QUEST1_CALIB_CAMS])
++{}
++
++bool
++quest1_slam_get_pose(struct quest1_slam *s, int64_t at_ns, struct xrt_space_relation *out)
++{
++	return false;
++}
++
++void
++quest1_slam_destroy(struct quest1_slam **s_ptr)
++{}
++
++#endif // XRT_FEATURE_SLAM
+diff --git a/src/xrt/drivers/quest1/quest1_slam.h b/src/xrt/drivers/quest1/quest1_slam.h
+new file mode 100644
+index 0000000..cc79856
+--- /dev/null
++++ b/src/xrt/drivers/quest1/quest1_slam.h
+@@ -0,0 +1,56 @@
++// Copyright 2026, Quest1-SteamOS contributors
++// SPDX-License-Identifier: BSL-1.0
++/*!
++ * @file
++ * @brief  Quest 1 6DoF head tracking: tracking cameras and IMU into Monado's SLAM tracker (Basalt).
++ * @ingroup drv_quest1
++ */
++
++#pragma once
++
++#include "xrt/xrt_defines.h"
++#include "util/u_logging.h"
++
++#include "quest1_calib.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++struct quest1_slam;
++
++/*!
++ * Starts the SLAM tracker with the driver's calibration; NULL if SLAM is not built in or the VIT
++ * library (default /opt/basalt/lib/libbasalt.so, VIT_SYSTEM_LIBRARY_PATH) cannot be loaded.
++ *
++ * @param cam_ids Calibration ids in tracker order; the first two must be the stereo pair (0, 2).
++ * @param frame_divider Only every n-th frameset of the 30 Hz stream goes to the tracker.
++ */
++struct quest1_slam *
++quest1_slam_create(const struct quest1_calib *calib,
++                   const int *cam_ids,
++                   int cam_count,
++                   int frame_divider,
++                   enum u_logging_level log_level);
++
++//! Rectified IMU sample (device axes, SI units) on the monotonic clock. Never blocks.
++void
++quest1_slam_push_imu(struct quest1_slam *s, int64_t timestamp_ns, const struct xrt_vec3 *accel, const struct xrt_vec3 *gyro);
++
++//! A frameset (calibration id order, 640x480 Y8, mid-exposure on the monotonic clock). Never blocks.
++void
++quest1_slam_push_frameset(struct quest1_slam *s, int64_t timestamp_ns, const uint8_t *const pixels[QUEST1_CALIB_CAMS]);
++
++/*!
++ * Device pose (the calibration's device frame: +X right, +Y up, +Z back) in an OpenXR-style
++ * world (+Y up). False until the tracker has produced its first pose.
++ */
++bool
++quest1_slam_get_pose(struct quest1_slam *s, int64_t at_timestamp_ns, struct xrt_space_relation *out_relation);
++
++void
++quest1_slam_destroy(struct quest1_slam **s_ptr);
 +
 +#ifdef __cplusplus
 +}

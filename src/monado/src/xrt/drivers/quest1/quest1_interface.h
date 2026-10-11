@@ -27,7 +27,7 @@ extern "C" {
 bool
 quest1_detect(void);
 
-//! 3DoF HMD, display set up for the 2880x1600 framebuffer that the panels show rotated by 180°.
+//! HMD (3DoF, 6DoF with SLAM), display set up for the 2880x1600 framebuffer that the panels show rotated by 180°.
 struct xrt_device *
 quest1_hmd_create(void);
 
@@ -70,8 +70,15 @@ struct quest1_controller_state
 //! Tracking cameras on the HMD's SyncBoss handle, frames in shared memory (quest1_cameras_shm.h).
 struct quest1_cameras;
 
+/*!
+ * Called from the camera thread for every HEADSET frameset with a SyncBoss shutter time
+ * (mid-exposure, IMU clock, ns); pixels are 640x480 Y8 by calibration Id, valid during the call.
+ */
+typedef void (*quest1_frameset_fn)(void *data, int64_t shutter_ns, const uint8_t *const pixels[4]);
+
+//! With a consumer the cameras stream all the time, otherwise only while a shm reader asks.
 struct quest1_cameras *
-quest1_cameras_start(void *sb_handle, enum u_logging_level log_level);
+quest1_cameras_start(void *sb_handle, enum u_logging_level log_level, quest1_frameset_fn consumer, void *consumer_data);
 
 //! Stops the camera thread (and the cameras); the IMU thread may still push. c may be NULL.
 void

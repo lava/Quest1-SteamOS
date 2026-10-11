@@ -3,7 +3,8 @@
 /*!
  * @file
  * @brief  Quest 1 tracking cameras: the src/qcam capture sequence on the driver's SyncBoss handle,
- *         HEADSET frames published to shared memory (quest1_cameras_shm.h) while readers ask for them.
+ *         HEADSET frames published to shared memory (quest1_cameras_shm.h) while readers ask for them,
+ *         and handed to an in-driver consumer (SLAM), which keeps the cameras running.
  *
  * libsyncboss powers and syncs the four OV7251 sensors, libqcameraoculushal (Qualcomm camera_v2
  * mini-driver) streams them; both are bionic libraries loaded with libhybris. The IMU thread keeps
@@ -148,6 +149,8 @@ struct quest1_cameras
 	uint8_t params[256];
 
 	struct q1cam_shm *shm;
+	quest1_frameset_fn consumer; //!< NULL = none; set before the thread starts
+	void *consumer_data;
 	int exposure_us, exposure_max_us;
 	uint16_t gain_x16, gain_min_x16;
 	bool auto_exposure;
@@ -497,6 +500,13 @@ capture_frameset(struct quest1_cameras *c, uint64_t *seq)
 		(*seq)++;
 		__atomic_store_n(&s->seq, *seq, __ATOMIC_RELEASE);
 		__atomic_store_n(&c->shm->latest, *seq, __ATOMIC_RELEASE);
+		if (c->consumer != NULL && s->shutter_ns != 0) {
+			const uint8_t *pixels[Q1CAM_N];
+			for (int i = 0; i < Q1CAM_N; i++) {
+				pixels[i] = s->pixels[i];
+			}
+			c->consumer(c->consumer_data, s->shutter_ns, pixels);
+		}
 		if (c->auto_exposure && *seq % 8 == 0) {
 			update_exposure(c, s);
 		}
@@ -507,6 +517,9 @@ capture_frameset(struct quest1_cameras *c, uint64_t *seq)
 static bool
 demanded(struct quest1_cameras *c)
 {
+	if (c->consumer != NULL) {
+		return true;
+	}
 	int64_t demand = (int64_t)__atomic_load_n(&c->shm->demand_ns, __ATOMIC_ACQUIRE);
 	return demand != 0 && os_monotonic_get_ns() - demand < CAM_DEMAND_TIMEOUT_NS;
 }
@@ -558,11 +571,13 @@ camera_thread(void *ptr)
  */
 
 struct quest1_cameras *
-quest1_cameras_start(void *sb_handle, enum u_logging_level log_level)
+quest1_cameras_start(void *sb_handle, enum u_logging_level log_level, quest1_frameset_fn consumer, void *consumer_data)
 {
 	struct quest1_cameras *c = U_TYPED_CALLOC(struct quest1_cameras);
 	c->log_level = log_level;
 	c->sb = sb_handle;
+	c->consumer = consumer;
+	c->consumer_data = consumer_data;
 	int64_t exp = debug_get_num_option_quest1_camera_exposure();
 	c->auto_exposure = exp <= 0;
 	c->exposure_us = c->auto_exposure ? 8000 : (int)exp;

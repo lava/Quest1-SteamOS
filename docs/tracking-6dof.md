@@ -14,6 +14,58 @@ Scratch scripts are in `%TEMP%\claude\...\scratchpad\t6\`; symbol dumps are in `
 
 ---
 
+## Update 2026-10-11: Path O SLAM runs inside Monado on the headset
+
+Basalt now runs inside `monado-service`. The quest1 driver feeds it with
+`quest1_slam.c` and `quest1_calib.c` (see `src/monado/README.md`). Status of the live run:
+
+* **Inputs.** HEADSET framesets from cameras 0 and 2 (the bottom stereo pair), timestamped with
+  the SyncBoss shutter time, plus the 1 kHz IMU. Frames and IMU share one MCU-to-monotonic offset.
+  The IMU is rectified with Meta's calibration (newest `online/<id>`). KB4 is fitted to Fisheye62
+  in C; the fit gives the same numbers as `tools/quest1-basalt-prep.py` (rms 0.07 to 0.32 px).
+  Basalt gets the calibration through VIT and needs no calibration file.
+* **Pose frames.**
+  * Basalt's IMU frame is the device frame (+X right, +Y up, +Z back), because `DeviceFromImu` is
+    a pure translation. Basalt's world is +Z up.
+  * The driver reports `Rx(-90°) · T_world_imu · inv(DeviceFromImu)`.
+  * Checked on the offline walking run: the headset's up axis maps to world +Y within 5°, and the
+    walking direction matches the device's forward axis (median cos 0.9).
+* **Rate and latency.**
+  * Basalt's optical flow costs about 70 ms of CPU per stereo frameset on the SD835. At 30 Hz its
+    main thread saturates: at most about 27 fps, a latency that grows past 300 ms, and dropped
+    frames.
+  * The driver therefore sends 15 Hz (`QUEST1_SLAM_FRAME_DIVIDER=2`). On the host walking dataset,
+    15 Hz gives the same trajectory as 30 Hz (path 12.1 m vs 12.3 m, loop closure 0.49 m vs
+    0.47 m).
+  * Live at 15 Hz: 15.0 poses/s. Latency from mid-exposure to the pose reaching Monado is 79 ms
+    median and 94 ms p90 (`SLAM_WRITE_CSVS`). About 23 ms of that is camera delivery.
+* **CPU** (`monado-service`, per-thread jiffies over 10 to 15 s):
+
+  | Configuration | Cores | Notes |
+  |---|---|---|
+  | SLAM off | 0.015 | |
+  | SLAM, 2 cameras, 15 Hz | about 1.9 | Basalt main thread ~0.56, 7 TBB workers ~0.17 each |
+  | Same, with xrgears running | 2.1 | Whole system 28% of 8 cores |
+  | SLAM, 4 cameras, 15 Hz | about 2.45 | Main thread saturated, ~6% framesets dropped |
+* **Quality: not yet judged with the headset worn.**
+  * All live runs had the headset lying on a desk. Its bottom cameras were looking at a box a few
+    centimetres away, and the room was dim (mean level 21 to 25 at a 6 ms exposure with 7.8x gain).
+  * In this scene Basalt keeps only about 7 landmarks. Position drifts and then runs away
+    quadratically: 1 to 4 m within 10 s at 15 Hz.
+  * Offline `basalt_vio` on the headset, run on a q1record recording of the same scene, behaves the
+    same way: 0.45 m in 20 s at 30 Hz, runaway at 15 Hz, 0.09 m with four cameras at 15 Hz. So the
+    live pipeline matches offline Basalt; the drift comes from the scene and the frame rate.
+  * The driver resets a tracker that goes faster than 3 m/s or ends up more than 10 m from its
+    origin. Until the poses are plausible again it reports 3DoF.
+* **Next steps.**
+  * Judge the tracking with the headset worn in a lit room.
+  * Cheaper optical flow, so that 30 Hz or four cameras become possible. Candidates: fewer TBB
+    threads (only settable through a Basalt config file today), a smaller patch pattern.
+  * A Basalt VIO config passed by the driver: today Basalt runs `VioConfig()` defaults, which are
+    close to `default_config.json`.
+  * The image still installs the SLAM-less `monado-service`. Building it from the SLAM tree is a
+    one-line change in the image build.
+
 ## Update 2026-10-06 evening: Path O step 1 works on the device
 
 `src/qcam/qcam.c` grabs frames from **all four tracking cameras natively** (Holo, no Android, no

@@ -3,6 +3,7 @@
 #  - Wi-Fi without persistent writes (quest1-modem.service, wpa_supplicant, dhcpcd on wlan0)
 #  - the GPU through libhybris (quest1-gpu.service, Android HAL daemons, hybris-run)
 #  - Monado (OpenXR runtime, monado.service) with the xrgears demo; xr-run starts clients: xr-run xrgears
+#  - audio: ADSP boot, CM710X sound card and Android's speaker route (quest1-audio.service), ALSA
 #  - iw, ip (iproute2) and hostname (inetutils) for work on the headset
 #  - network sockets for non-root (Android "inet" group), so timesyncd sets the clock; networkd on 4.4
 #  - OpenSSH: root login with a key only
@@ -33,7 +34,14 @@ core libnetfilter_conntrack-1.0.9-2-aarch64.pkg.tar.zst 708988b0ec002283b30d7e94
 core iptables-1:1.8.11-2-aarch64.pkg.tar.zst 35171376ec63b9f78427d7465da4f7f7d7adc51970233580161a57d97962c476
 core libbpf-1.5.1-1-aarch64.pkg.tar.zst 130e09fb57d4b26342829793d62f9b56814d2b8da1e53252fed66c05445e2f17
 core iproute2-6.17.0-1-aarch64.pkg.tar.zst b05e855eb60c40f2b353f7e3ab24e24e6093bd7ac80e733c3b579555c8182e55
-core inetutils-2.6-1-aarch64.pkg.tar.zst 0f7237debe5e205e942edff6ef76506bdb85d55c03ddcd2e54a362974b4688cf"
+core inetutils-2.6-1-aarch64.pkg.tar.zst 0f7237debe5e205e942edff6ef76506bdb85d55c03ddcd2e54a362974b4688cf
+core pciutils-3.14.0-1-aarch64.pkg.tar.zst 84008b6de6145c5da676e0b05259025c79a6f7deccd1a2b0584ce4c8e6082a8f
+core psmisc-23.7-1.2-aarch64.pkg.tar.zst 92ee5919c0d4b72e600f6751c34ece117b058b463f657787ea2f1efb968c7162
+extra alsa-topology-conf-1.2.5.1-4-any.pkg.tar.zst a76b237e24973099b3cee9d3c89f4f8b46d9133411f0992bd46a5131e4427a0c
+extra alsa-ucm-conf-1.2.14-2-any.pkg.tar.zst fcd43d67a74282e76f56f5f5ca7c1dcfad3d12ddd7efc51353f84ba177e89181
+extra alsa-lib-1.2.14-2-aarch64.pkg.tar.zst d5bed06296bd6817135a282fcd6b7ef7e4a719af94814e7466c0c3878ef9d0b1
+extra libsamplerate-0.2.2-3-aarch64.pkg.tar.zst 96dcdf4b472889e5d48be8066c594ef886282bff73c90fa510f7dd2bb3e7d039
+extra alsa-utils-1.2.14-1-aarch64.pkg.tar.zst f048dd5a4085f819c20b33589a622723c6ac2f9ab88260c5e93c65a4f4893bf5"
 
 [[ -f $R/etc/quest1-base-release ]] || { echo "No prepared rootfs at $R" >&2; exit 1; }
 for f in wpa_supplicant-wlan0.conf root.pub; do
@@ -225,6 +233,26 @@ Restart=on-failure
 [Install]
 WantedBy=multi-user.target"
 link etc/systemd/system/multi-user.target.wants/monado.service /etc/systemd/system/monado.service
+
+# Audio: the ADSP is booted once per boot (never unloaded); the CM710X codec firmware and the
+# mixer settings come from system_b, so this needs quest1-modem's mounts and firmware path.
+put 755 "$P/device/quest1-audio.sh" usr/local/sbin/quest1-audio
+put 644 "$P/device/mixer-paths.py" usr/local/lib/quest1/mixer-paths.py
+unit quest1-audio.service '[Unit]
+Description=ADSP, CM710X sound card and the speaker route
+# quest1-modem may still fail later, on the Wi-Fi
+Wants=quest1-modem.service
+After=quest1-modem.service
+Before=sound.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/quest1-audio
+
+[Install]
+WantedBy=multi-user.target'
+link etc/systemd/system/multi-user.target.wants/quest1-audio.service /etc/systemd/system/quest1-audio.service
 
 f=$R/etc/quest1-base-release
 grep -q '^REMOTE_ACCESS=' "$f" || cat >> "$f" <<'EOF'

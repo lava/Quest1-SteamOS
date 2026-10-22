@@ -1,0 +1,37 @@
+--- a/src/xrt/compositor/main/CMakeLists.txt
++++ b/src/xrt/compositor/main/CMakeLists.txt
+@@ -21,7 +21,6 @@
+ 	comp_target_swapchain.h
+ 	comp_window.h
+ 	comp_window_debug_image.c
+-	comp_window_qbridge.c
+ 	comp_window_mdp.c
+ 	comp_mirror_to_debug_gui.c
+ 	comp_mirror_to_debug_gui.h
+@@ -125,5 +124,6 @@
+ target_include_directories(comp_main SYSTEM PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/msm)
+ 
+ if(XRT_BUILD_DRIVER_QBRIDGE)
++	target_sources(comp_main PRIVATE comp_window_qbridge.c)
+ 	target_link_libraries(comp_main PRIVATE drv_qbridge)
+ endif()
+--- a/src/xrt/compositor/main/comp_compositor.c
++++ b/src/xrt/compositor/main/comp_compositor.c
+@@ -46,6 +46,7 @@
+ #include "xrt/xrt_compiler.h"
+ #include "xrt/xrt_compositor.h"
+ #include "xrt/xrt_config_have.h"
++#include "xrt/xrt_config_drivers.h"
+ #include "xrt/xrt_results.h"
+ 
+ #include "math/m_api.h"
+@@ -839,7 +840,9 @@
+     &comp_target_factory_vk_display,
+ #endif
+     &comp_target_factory_mdp,
++#ifdef XRT_BUILD_DRIVER_QBRIDGE
+     &comp_target_factory_qbridge,
++#endif
+     &comp_target_factory_debug_image,
+ };
+ 

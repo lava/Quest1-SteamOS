@@ -1,0 +1,50 @@
+diff --git a/drivers/staging/oculus/Kconfig b/drivers/staging/oculus/Kconfig
+index e898115d4..7c593ce11 100644
+--- a/drivers/staging/oculus/Kconfig
++++ b/drivers/staging/oculus/Kconfig
+@@ -241,7 +241,7 @@ config VIRTUAL_SENSOR_UTILS
+ 	help
+ 	  This driver implements virtual thermal sensor helper functionality.
+ 
+-source "drivers/staging/oculus/internal/Kconfig"
++# Internal drivers are not included in this public source release.
+ source "drivers/staging/oculus/mcu/Kconfig"
+ 
+ endif # OCULUS
+diff --git a/drivers/staging/oculus/Makefile b/drivers/staging/oculus/Makefile
+index f611a26dd..485ac91cd 100644
+--- a/drivers/staging/oculus/Makefile
++++ b/drivers/staging/oculus/Makefile
+@@ -32,5 +32,4 @@ obj-$(CONFIG_RT600_CTRL) 		+= rt600-ctrl.o
+ obj-$(CONFIG_TOP_PANEL_SENSOR)		+= top_panel_sensor.o
+ obj-$(CONFIG_SPI_STP)			+= stp/
+ obj-$(CONFIG_VIRTUAL_SENSOR_UTILS)	+= virtual_sensor_utils.o
+-obj-y					+= internal/
+ obj-y					+= mcu/
+diff --git a/drivers/usb/gadget/function/f_ncm.c b/drivers/usb/gadget/function/f_ncm.c
+index 8be8d10a0..c19c0faea 100644
+--- a/drivers/usb/gadget/function/f_ncm.c
++++ b/drivers/usb/gadget/function/f_ncm.c
+@@ -530,6 +530,7 @@ static inline void ncm_reset_values(struct f_ncm *ncm)
+ {
+ 	ncm->parser_opts = &ndp16_opts;
+ 	ncm->is_crc = false;
++	ncm->ndp_sign = ncm->parser_opts->ndp_sign;	/* holo: ndp_sign */
+ 	ncm->port.cdc_filter = DEFAULT_FILTER;
+ 
+ 	/* doesn't make sense for ncm, fixed size used */
+@@ -780,10 +781,14 @@ static int ncm_setup(struct usb_function *f, const struct usb_ctrlrequest *ctrl)
+ 		switch (w_value) {
+ 		case 0x0000:
+ 			ncm->parser_opts = &ndp16_opts;
++			ncm->ndp_sign = ncm->parser_opts->ndp_sign |
++				(ncm->is_crc ? NCM_NDP_HDR_CRC : NCM_NDP_HDR_NOCRC);
+ 			DBG(cdev, "NCM16 selected\n");
+ 			break;
+ 		case 0x0001:
+ 			ncm->parser_opts = &ndp32_opts;
++			ncm->ndp_sign = ncm->parser_opts->ndp_sign |
++				(ncm->is_crc ? NCM_NDP_HDR_CRC : NCM_NDP_HDR_NOCRC);
+ 			DBG(cdev, "NCM32 selected\n");
+ 			break;
+ 		default:

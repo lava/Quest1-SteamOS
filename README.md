@@ -1,5 +1,11 @@
 # Quest1-SteamOS
 
+> **This is a fork** of [nicolas-riera/Quest1-SteamOS](https://github.com/nicolas-riera/Quest1-SteamOS).
+> It adds a second path: a system image built from Valve's public Holo base, read-only use of
+> the Android partitions, 6DoF head tracking with Basalt SLAM, and an optional permanent
+> install on slot A with stock Android kept on slot B. See
+> [docs/holo-image.md](docs/holo-image.md). The rest of this README describes upstream.
+
 > **Disclaimer: this whole project was entirely vibecoded.** Every line of code, every
 > script and this README were written by an AI (Claude), directed and tested on real
 > hardware by a human who did not write the code. It works on the headset it was tested on;
@@ -120,6 +126,7 @@ the headset they are used from its own partitions, mounted read-only.
 | [6DoF study](docs/tracking-6dof.md) | Paths to inside-out tracking |
 | [Tracking IPC](docs/tracking-ipc.md) | Talking to Meta's tracking service |
 | [SteamOS image](docs/rootfs-build.md) | What the system image holds, and the plan to build and install it reproducibly |
+| [Public Holo image (fork)](docs/holo-image.md) | Building the image from Valve's public base, installing it, and the permanent install on slot A |
 | [Phase 0](docs/phase0-recon.md) | First survey of the headset (in French) |
 
 ## Building
@@ -144,7 +151,8 @@ show how.
 ## Safety
 
 - Everything boots with `fastboot boot`. Nothing in this project flashes, erases or
-  unlocks a partition.
+  unlocks a partition, except the optional permanent install of this fork's path, which
+  flashes `boot_a` and switches to slot A ([docs/holo-image.md](docs/holo-image.md)).
 - The headset's own Android partitions are only mounted read-only.
 - The Linux system lives in a file on the data partition. A factory reset deletes it, and
   the headset is back to stock.

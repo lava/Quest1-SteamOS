@@ -57,9 +57,10 @@ unlocked=$("$fb" -s "$serial" getvar unlocked 2>&1)
     echo 'The bootloader did not report an unlocked state.' >&2; exit 1;
 }
 slot=$("$fb" -s "$serial" getvar current-slot 2>&1)
-[[ "$slot" =~ current-slot:[[:space:]]*b([[:space:]]|$) ]] || {
-    echo 'This prepared image expects original slot B; no boot attempted.' >&2; exit 1;
+[[ "$slot" =~ current-slot:[[:space:]]*([ab])([[:space:]]|$) ]] || {
+    echo 'Could not read the current slot; no boot attempted.' >&2; exit 1;
 }
+echo "Current slot: ${BASH_REMATCH[1]}"
 echo 'Loading the SteamOS base kernel into RAM using fastboot boot.'
 echo 'An installed /data/steamos/holo.img will be mounted read-write; otherwise this starts a rescue shell.' 
 "$fb" -s "$serial" boot "$image"

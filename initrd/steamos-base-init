@@ -81,8 +81,8 @@ else
     log "USB network unavailable; use USB serial"
 fi
 
-# The source slot was verified as B after returning from the minimal shell.
-# Never start this prepared image from the downgraded inactive slot.
+# Booted from B (stock, by fastboot boot) or A (where this boot image is flashed). The Android
+# files Holo uses always come from slot B (quest1-modem.sh), whichever slot booted.
 SLOT=
 for arg in $(cat /proc/cmdline); do
  case "$arg" in androidboot.slot_suffix=*) SLOT=${arg#*=};; esac
@@ -97,7 +97,7 @@ handover_failed() {
  done
 }
 boot_holo() {
- [ "$SLOT" = _b ] || { log "Expected Android slot _b, found '$SLOT'; staying in rescue shell"; return; }
+ case "$SLOT" in _a|_b) ;; *) log "Unknown Android slot '$SLOT'; staying in rescue shell"; return;; esac
  mkdir -p /data /newroot
  UD=
  for event in /sys/class/block/sd*/uevent; do

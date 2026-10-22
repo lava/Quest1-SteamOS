@@ -357,6 +357,21 @@ EOF
 # of the Venus nodes starts a firmware load before /run/fw exists. Nothing needs v4l names.
 link etc/udev/rules.d/60-persistent-v4l.rules /dev/null
 
+# A/B boot: mark the booted slot successful once the system is up, or the bootloader falls back to
+# the other slot after 7 boots of the flashed slot A.
+put 755 "$P/device/quest1-slot.py" usr/local/sbin/quest1-slot
+unit quest1-slot.service '[Unit]
+Description=Mark the booted A/B slot successful
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/quest1-slot mark-successful
+
+[Install]
+WantedBy=multi-user.target'
+link etc/systemd/system/multi-user.target.wants/quest1-slot.service /etc/systemd/system/quest1-slot.service
+
 # OpenXR: Monado (/opt/monado, built with the Quest 1 driver) as a service; clients run through
 # xr-run, e.g. xr-run xrgears. The proximity sensor blanks the display as usual (no QUEST1_IGNORE_PROX).
 [[ -x $R/opt/monado/bin/monado-service ]] || { echo "No Monado in $R/opt/monado" >&2; exit 1; }
